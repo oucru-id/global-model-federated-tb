@@ -21,7 +21,6 @@ def load_distance_matrix(filepath):
 
 
 def normalize_distances(distance_matrix):
-
     max_dist = distance_matrix.values.max()
     if max_dist > 0:
         return distance_matrix / max_dist
@@ -29,7 +28,6 @@ def normalize_distances(distance_matrix):
 
 
 def count_tree_tips(tree_file):
-
     with open(tree_file, 'r') as f:
         tree_str = f.read().strip()
     
@@ -41,7 +39,6 @@ def count_tree_tips(tree_file):
 
 
 def get_tree_tips(tree_file):
-
     with open(tree_file, 'r') as f:
         tree_str = f.read().strip()
     
@@ -72,7 +69,6 @@ def load_trees_dendropy(tree_files):
 
 
 def build_pdm_from_matrix(distance_matrix, taxa):
-
     for sample in distance_matrix.index:
         taxa.require_taxon(label=sample)
     
@@ -89,7 +85,44 @@ def build_pdm_from_matrix(distance_matrix, taxa):
     return pdm
 
 
-def constrained_neighbor_joining(distance_matrix, constraint_trees=None):
+def root_tree_by_outgroup(tree, outgroup_name="ERR4872250"):
+
+    try:
+        outgroup_node = None
+        for leaf in tree.leaf_node_iter():
+            if leaf.taxon and leaf.taxon.label == outgroup_name:
+                outgroup_node = leaf
+                break
+        
+        if outgroup_node is None:
+            print(f"Warning: Outgroup '{outgroup_name}' not found in tree")
+            return tree, False
+        
+        tree.reroot_at_edge(
+            outgroup_node.edge,
+            update_bipartitions=True,
+            length1=outgroup_node.edge_length / 2 if outgroup_node.edge_length else 0,
+            length2=outgroup_node.edge_length / 2 if outgroup_node.edge_length else 0
+        )
+        print(f"Rooted tree using outgroup: {outgroup_name}")
+        return tree, True
+        
+    except Exception as e:
+        print(f"Could not root by outgroup {outgroup_name}: {e}")
+        return tree, False
+
+
+def root_tree_midpoint(tree):
+    try:
+        tree.reroot_at_midpoint(update_bipartitions=True)
+        print("Rooted tree using midpoint rooting")
+        return tree, True
+    except Exception as e:
+        print(f"Could not perform midpoint rooting: {e}")
+        return tree, False
+
+
+def constrained_neighbor_joining(distance_matrix, constraint_trees=None, outgroup="ERR4872250"):
 
     samples = list(distance_matrix.index)
     n = len(samples)
@@ -183,15 +216,26 @@ def constrained_neighbor_joining(distance_matrix, constraint_trees=None):
     if len(active) == 2:
         idx_i, idx_j = active
         dist = max(0, D[idx_i, idx_j] / 2)
-        return f"({tree_strs[idx_i]}:{dist:.6f},{tree_strs[idx_j]}:{dist:.6f});"
+        final_tree = f"({tree_strs[idx_i]}:{dist:.6f},{tree_strs[idx_j]}:{dist:.6f});"
     else:
-        return f"({tree_strs[active[0]]}:0);"
+        final_tree = f"({tree_strs[active[0]]}:0);"
+    
+    if DENDROPY_AVAILABLE and outgroup in samples:
+        try:
+            taxa = dendropy.TaxonNamespace(samples)
+            tree = dendropy.Tree.get(data=final_tree, schema="newick", taxon_namespace=taxa)
+            tree, rooted = root_tree_by_outgroup(tree, outgroup)
+            if rooted:
+                return tree.as_string(schema="newick")
+        except Exception as e:
+            print(f"Could not root NJ tree: {e}")
+    
+    return final_tree
 
 
-def merge_trees_improved(tree_files, global_matrix, anchors, output_file):
-
+def merge_trees_improved(tree_files, global_matrix, anchors, output_file, outgroup="ERR4872250"):
     print("=" * 60)
-    print("Improved Tree Merging Algorithm")
+    print("Tree Merging Algorithm")
     print("=" * 60)
     
     max_dist = global_matrix.values.max()
@@ -202,6 +246,7 @@ def merge_trees_improved(tree_files, global_matrix, anchors, output_file):
     
     all_samples = list(global_matrix.index)
     print(f"Total samples: {len(all_samples)}")
+    print(f"Outgroup for rooting: {outgroup}")
     
     constraint_trees = None
     
@@ -214,18 +259,18 @@ def merge_trees_improved(tree_files, global_matrix, anchors, output_file):
         except Exception as e:
             print(f"Could not load constraint trees: {e}")
     
-    newick_tree = constrained_neighbor_joining(normalized_matrix, constraint_trees)
+    newick_tree = constrained_neighbor_joining(normalized_matrix, constraint_trees, outgroup)
     
     with open(output_file, 'w') as f:
         f.write(newick_tree)
     
-    print(f"Merged tree written to {output_file}")
+    print(f"Merged tree saved to {output_file}")
     return newick_tree
 
 
-def merge_trees_dendropy_nj(tree_files, global_matrix, anchors, output_file):
-
+def merge_trees_dendropy_nj(tree_files, global_matrix, anchors, output_file, outgroup="ERR4872250"):
     print("Building merged tree using DendroPy NJ")
+    print(f"Outgroup for rooting: {outgroup}")
     
     max_dist = global_matrix.values.max()
     normalized_matrix = global_matrix / max_dist if max_dist > 0 else global_matrix
@@ -242,18 +287,30 @@ def merge_trees_dendropy_nj(tree_files, global_matrix, anchors, output_file):
             pdm[t1, t2] = float(normalized_matrix.iloc[i, j])
     
     tree = pdm.nj_tree()
+    
+    if outgroup in all_samples:
+        tree, rooted = root_tree_by_outgroup(tree, outgroup)
+        if not rooted:
+            print("Using midpoint rooting")
+            tree, _ = root_tree_midpoint(tree)
+    else:
+        print(f"Outgroup {outgroup} not in samples, using midpoint rooting")
+        tree, _ = root_tree_midpoint(tree)
+    
     tree.write(path=output_file, schema="newick")
     
-    print(f"Merged tree written to {output_file}")
+    print(f"Merged tree saved to {output_file}")
     return tree.as_string(schema="newick")
 
 
-def calculate_merge_statistics(tree_files, output_file, global_matrix):
+def calculate_merge_statistics(tree_files, output_file, global_matrix, outgroup):
     stats = {
         "num_input_trees": len(tree_files),
         "input_tree_sizes": [count_tree_tips(f) for f in tree_files],
         "merged_tree_size": count_tree_tips(output_file),
-        "method": "constrained_neighbor_joining",
+        "method": "neighbor_joining",
+        "rooting_method": "outgroup",
+        "outgroup": outgroup,
         "matrix_size": len(global_matrix),
         "max_distance": float(global_matrix.values.max()),
         "min_distance": float(global_matrix.values[global_matrix.values > 0].min()) if (global_matrix.values > 0).any() else 0,
@@ -264,7 +321,7 @@ def calculate_merge_statistics(tree_files, output_file, global_matrix):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Merge phylogenetic trees using NJ algorithm"
+        description="Merge phylogenetic trees using NJ algorithm with outgroup rooting"
     )
     parser.add_argument('--trees', nargs='+', required=True, help="Input tree files")
     parser.add_argument('--matrix', type=str, required=True, help="Global distance matrix")
@@ -272,6 +329,8 @@ def main():
     parser.add_argument('--anchors', type=str, required=True, help="Comma-separated anchor samples")
     parser.add_argument('--output', type=str, default="global_tree.nwk", help="Output tree file")
     parser.add_argument('--stats', type=str, default="merge_stats.json", help="Output stats file")
+    parser.add_argument('--outgroup', type=str, default="ERR4872250", 
+                        help="Outgroup for rooting (default: ERR4872250, Lineage 5)")
     args = parser.parse_args()
     
     anchors = [a.strip() for a in args.anchors.split(',')]
@@ -283,18 +342,19 @@ def main():
     print(f"Loaded {len(args.trees)} trees")
     print(f"Global matrix: {len(global_matrix)} samples")
     print(f"Anchors: {anchors}")
+    print(f"Outgroup: {args.outgroup}")
     print(f"DendroPy available: {DENDROPY_AVAILABLE}")
     
     if DENDROPY_AVAILABLE:
         try:
-            merge_trees_dendropy_nj(args.trees, global_matrix, anchors, args.output)
+            merge_trees_dendropy_nj(args.trees, global_matrix, anchors, args.output, args.outgroup)
         except Exception as e:
             print(f"DendroPy NJ failed: {e}, using custom implementation")
-            merge_trees_improved(args.trees, global_matrix, anchors, args.output)
+            merge_trees_improved(args.trees, global_matrix, anchors, args.output, args.outgroup)
     else:
-        merge_trees_improved(args.trees, global_matrix, anchors, args.output)
+        merge_trees_improved(args.trees, global_matrix, anchors, args.output, args.outgroup)
     
-    stats = calculate_merge_statistics(args.trees, args.output, global_matrix)
+    stats = calculate_merge_statistics(args.trees, args.output, global_matrix, args.outgroup)
     stats["anchors"] = anchors
     stats["input_files"] = [os.path.basename(f) for f in args.trees]
     
