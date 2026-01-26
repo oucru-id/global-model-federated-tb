@@ -21,7 +21,8 @@ process MERGE_MATRICES {
         --primary-anchor "${primary_anchor}" \\
         --output global_distance_matrix.tsv \\
         --report correction_report.json \\
-        --mapping samples_mapping.json
+        --mapping samples_mapping.json \\
+        --method ${params.imputation_method}
     """
 }
 
@@ -33,6 +34,7 @@ process MERGE_TREES {
     path global_matrix
     path mapping
     val anchors
+    val outgroup
 
     output:
     path "global_tree.nwk",        emit: tree
@@ -45,6 +47,7 @@ process MERGE_TREES {
         --matrix ${global_matrix} \\
         --mapping ${mapping} \\
         --anchors "${anchors}" \\
+        --outgroup "${outgroup}" \\
         --output global_tree.nwk \\
         --stats merge_stats.json
     """
@@ -82,7 +85,8 @@ workflow FEDERATED_MERGE {
         tree_files, 
         MERGE_MATRICES.out.global_matrix, 
         MERGE_MATRICES.out.mapping, 
-        anchors
+        anchors,
+        params.tree_outgroup
     )
     GENERATE_GLOBAL_METADATA(MERGE_MATRICES.out.mapping, MERGE_TREES.out.tree)
 
