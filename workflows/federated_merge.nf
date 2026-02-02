@@ -49,7 +49,8 @@ process MERGE_TREES {
         --anchors "${anchors}" \\
         --outgroup "${outgroup}" \\
         --output global_tree.nwk \\
-        --stats merge_stats.json
+        --stats merge_stats.json \\
+        --normalize ${params.tree_normalize}
     """
 }
 
