@@ -122,15 +122,42 @@ def root_tree_midpoint(tree):
         return tree, False
 
 
-def constrained_neighbor_joining(distance_matrix, constraint_trees=None, outgroup="ERR4872250"):
+def normalize_for_tree(distance_matrix, method='max'):
+    """
+    Normalize distances for tree visualization.
+    
+    Methods:
+    - 'max': Divide by maximum distance (gives 0-1 scale)
+    - 'genome': Divide by approximate TB genome size (~4.4M bp)
+    - 'none': No normalization (raw SNP counts)
+    """
+    if method == 'none':
+        return distance_matrix.copy(), 1.0
+    elif method == 'max':
+        max_dist = distance_matrix.values.max()
+        if max_dist > 0:
+            return distance_matrix / max_dist, max_dist
+        return distance_matrix.copy(), 1.0
+    elif method == 'genome':
+        # TB genome is ~4.4 million bp, but for SNP distances
+        # we typically normalize by max observed or a reference
+        genome_size = 4411532  # H37Rv genome size
+        return distance_matrix / genome_size, genome_size
+    else:
+        return distance_matrix.copy(), 1.0
 
+
+def constrained_neighbor_joining(distance_matrix, constraint_trees=None, outgroup="ERR4872250"):
+    """
+    NJ with cleaner branch length formatting.
+    """
     samples = list(distance_matrix.index)
     n = len(samples)
     
     if n < 3:
         if n == 2:
             d = distance_matrix.iloc[0, 1]
-            return f"({samples[0]}:{d/2:.6f},{samples[1]}:{d/2:.6f});"
+            return f"({samples[0]}:{d:.4f},{samples[1]}:{d:.4f});"
         elif n == 1:
             return f"({samples[0]}:0);"
         else:
@@ -201,7 +228,8 @@ def constrained_neighbor_joining(distance_matrix, constraint_trees=None, outgrou
         dist_i = max(0, dist_i)
         dist_j = max(0, dist_j)
         
-        new_node_str = f"({tree_strs[idx_i]}:{dist_i:.6f},{tree_strs[idx_j]}:{dist_j:.6f})"
+        # Use 3 decimal places for cleaner output
+        new_node_str = f"({tree_strs[idx_i]}:{dist_i:.3f},{tree_strs[idx_j]}:{dist_j:.3f})"
         tree_strs[idx_i] = new_node_str
         
         for k, idx_k in enumerate(active):
@@ -216,7 +244,7 @@ def constrained_neighbor_joining(distance_matrix, constraint_trees=None, outgrou
     if len(active) == 2:
         idx_i, idx_j = active
         dist = max(0, D[idx_i, idx_j] / 2)
-        final_tree = f"({tree_strs[idx_i]}:{dist:.6f},{tree_strs[idx_j]}:{dist:.6f});"
+        final_tree = f"({tree_strs[idx_i]}:{dist:.3f},{tree_strs[idx_j]}:{dist:.3f});"
     else:
         final_tree = f"({tree_strs[active[0]]}:0);"
     
@@ -233,16 +261,16 @@ def constrained_neighbor_joining(distance_matrix, constraint_trees=None, outgrou
     return final_tree
 
 
-def merge_trees_improved(tree_files, global_matrix, anchors, output_file, outgroup="ERR4872250"):
+def merge_trees_improved(tree_files, global_matrix, anchors, output_file, outgroup="ERR4872250", normalize='max'):
     print("=" * 60)
     print("Tree Merging Algorithm")
     print("=" * 60)
     
-    max_dist = global_matrix.values.max()
-    print(f"Maximum distance in matrix: {max_dist}")
+    # Normalize distances for tree building
+    working_matrix, norm_factor = normalize_for_tree(global_matrix, method=normalize)
     
-    normalized_matrix = global_matrix / max_dist if max_dist > 0 else global_matrix
-    print(f"Normalized distance range: {normalized_matrix.values.min():.4f} - {normalized_matrix.values.max():.4f}")
+    print(f"Normalization: {normalize} (factor: {norm_factor:.2f})")
+    print(f"Normalized distance range: {working_matrix.values.min():.6f} - {working_matrix.values.max():.6f}")
     
     all_samples = list(global_matrix.index)
     print(f"Total samples: {len(all_samples)}")
@@ -259,32 +287,33 @@ def merge_trees_improved(tree_files, global_matrix, anchors, output_file, outgro
         except Exception as e:
             print(f"Could not load constraint trees: {e}")
     
-    newick_tree = constrained_neighbor_joining(normalized_matrix, constraint_trees, outgroup)
+    newick_tree = constrained_neighbor_joining(working_matrix, constraint_trees, outgroup)
     
     with open(output_file, 'w') as f:
         f.write(newick_tree)
     
     print(f"Merged tree saved to {output_file}")
-    return newick_tree
+    return newick_tree, norm_factor
 
 
-def merge_trees_dendropy_nj(tree_files, global_matrix, anchors, output_file, outgroup="ERR4872250"):
+def merge_trees_dendropy_nj(tree_files, global_matrix, anchors, output_file, outgroup="ERR4872250", normalize='max'):
     print("Building merged tree using DendroPy NJ")
     print(f"Outgroup for rooting: {outgroup}")
     
-    max_dist = global_matrix.values.max()
-    normalized_matrix = global_matrix / max_dist if max_dist > 0 else global_matrix
+    # Normalize distances for tree building
+    working_matrix, norm_factor = normalize_for_tree(global_matrix, method=normalize)
     
-    all_samples = list(normalized_matrix.index)
+    all_samples = list(working_matrix.index)
     print(f"Total samples: {len(all_samples)}")
-    print(f"Distance range: {normalized_matrix.values.min():.4f} - {normalized_matrix.values.max():.4f}")
+    print(f"Normalization: {normalize} (factor: {norm_factor:.2f})")
+    print(f"Normalized distance range: {working_matrix.values.min():.6f} - {working_matrix.values.max():.6f}")
     
     taxa = dendropy.TaxonNamespace(all_samples)
     pdm = dendropy.PhylogeneticDistanceMatrix(taxon_namespace=taxa)
     
     for i, t1 in enumerate(taxa):
         for j, t2 in enumerate(taxa):
-            pdm[t1, t2] = float(normalized_matrix.iloc[i, j])
+            pdm[t1, t2] = float(working_matrix.iloc[i, j])
     
     tree = pdm.nj_tree()
     
@@ -300,7 +329,7 @@ def merge_trees_dendropy_nj(tree_files, global_matrix, anchors, output_file, out
     tree.write(path=output_file, schema="newick")
     
     print(f"Merged tree saved to {output_file}")
-    return tree.as_string(schema="newick")
+    return tree.as_string(schema="newick"), norm_factor
 
 
 def calculate_merge_statistics(tree_files, output_file, global_matrix, outgroup):
@@ -331,6 +360,8 @@ def main():
     parser.add_argument('--stats', type=str, default="merge_stats.json", help="Output stats file")
     parser.add_argument('--outgroup', type=str, default="ERR4872250", 
                         help="Outgroup for rooting (default: ERR4872250, Lineage 5)")
+    parser.add_argument('--normalize', type=str, default='max', choices=['none', 'max', 'genome'],
+                        help="Distance normalization method (default: max)")
     args = parser.parse_args()
     
     anchors = [a.strip() for a in args.anchors.split(',')]
@@ -343,20 +374,31 @@ def main():
     print(f"Global matrix: {len(global_matrix)} samples")
     print(f"Anchors: {anchors}")
     print(f"Outgroup: {args.outgroup}")
+    print(f"Normalization: {args.normalize}")
     print(f"DendroPy available: {DENDROPY_AVAILABLE}")
+    
+    norm_factor = 1.0
     
     if DENDROPY_AVAILABLE:
         try:
-            merge_trees_dendropy_nj(args.trees, global_matrix, anchors, args.output, args.outgroup)
+            _, norm_factor = merge_trees_dendropy_nj(
+                args.trees, global_matrix, anchors, args.output, args.outgroup, args.normalize
+            )
         except Exception as e:
             print(f"DendroPy NJ failed: {e}, using custom implementation")
-            merge_trees_improved(args.trees, global_matrix, anchors, args.output, args.outgroup)
+            _, norm_factor = merge_trees_improved(
+                args.trees, global_matrix, anchors, args.output, args.outgroup, args.normalize
+            )
     else:
-        merge_trees_improved(args.trees, global_matrix, anchors, args.output, args.outgroup)
+        _, norm_factor = merge_trees_improved(
+            args.trees, global_matrix, anchors, args.output, args.outgroup, args.normalize
+        )
     
     stats = calculate_merge_statistics(args.trees, args.output, global_matrix, args.outgroup)
     stats["anchors"] = anchors
     stats["input_files"] = [os.path.basename(f) for f in args.trees]
+    stats["normalization_method"] = args.normalize
+    stats["normalization_factor"] = norm_factor
     
     with open(args.stats, 'w') as f:
         json.dump(stats, f, indent=2)
