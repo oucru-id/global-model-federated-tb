@@ -124,9 +124,7 @@ def root_tree_midpoint(tree):
 
 def normalize_for_tree(distance_matrix, method='max'):
     """
-    Normalize distances for tree visualization.
-    
-    Methods:
+    Mode:
     - 'max': Divide by maximum distance (gives 0-1 scale)
     - 'genome': Divide by approximate TB genome size (~4.4M bp)
     - 'none': No normalization (raw SNP counts)
@@ -139,18 +137,14 @@ def normalize_for_tree(distance_matrix, method='max'):
             return distance_matrix / max_dist, max_dist
         return distance_matrix.copy(), 1.0
     elif method == 'genome':
-        # TB genome is ~4.4 million bp, but for SNP distances
-        # we typically normalize by max observed or a reference
-        genome_size = 4411532  # H37Rv genome size
+        genome_size = 4411532
         return distance_matrix / genome_size, genome_size
     else:
         return distance_matrix.copy(), 1.0
 
 
 def constrained_neighbor_joining(distance_matrix, constraint_trees=None, outgroup="ERR4872250"):
-    """
-    NJ with cleaner branch length formatting.
-    """
+
     samples = list(distance_matrix.index)
     n = len(samples)
     
@@ -228,7 +222,6 @@ def constrained_neighbor_joining(distance_matrix, constraint_trees=None, outgrou
         dist_i = max(0, dist_i)
         dist_j = max(0, dist_j)
         
-        # Use 3 decimal places for cleaner output
         new_node_str = f"({tree_strs[idx_i]}:{dist_i:.3f},{tree_strs[idx_j]}:{dist_j:.3f})"
         tree_strs[idx_i] = new_node_str
         
@@ -266,7 +259,6 @@ def merge_trees_improved(tree_files, global_matrix, anchors, output_file, outgro
     print("Tree Merging Algorithm")
     print("=" * 60)
     
-    # Normalize distances for tree building
     working_matrix, norm_factor = normalize_for_tree(global_matrix, method=normalize)
     
     print(f"Normalization: {normalize} (factor: {norm_factor:.2f})")
@@ -300,7 +292,6 @@ def merge_trees_dendropy_nj(tree_files, global_matrix, anchors, output_file, out
     print("Building merged tree using DendroPy NJ")
     print(f"Outgroup for rooting: {outgroup}")
     
-    # Normalize distances for tree building
     working_matrix, norm_factor = normalize_for_tree(global_matrix, method=normalize)
     
     all_samples = list(working_matrix.index)
