@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Matrix Completion: Soft Impute with anchor-guided.
-"""
 
 import pandas as pd
 import numpy as np
@@ -83,6 +80,54 @@ def calculate_correction_factor(matrices, anchors, primary_anchor):
             correction_factors.append(1.0)
     
     return correction_factors
+
+    return correction_factors
+
+
+def calculate_sample_bias(samples, all_known_distances, present_anchors, original_matrix):
+
+    sample_bias = {}
+    print("\n  Calculating Per-Sample Bias (PSBC)")
+    
+    for s in samples:
+        biases = []
+        known_neighbors = all_known_distances.get(s, {})
+        
+        for k, known_dist in known_neighbors.items():
+            if known_dist < 500:
+                continue
+            
+            min_anchor_sum = float('inf')
+            for anchor in present_anchors:
+                try:
+                    d1 = original_matrix.loc[s, anchor]
+                    d2 = original_matrix.loc[k, anchor]
+                    if not np.isnan(d1) and not np.isnan(d2) and d1 > 0 and d2 > 0:
+                        dist_sum = d1 + d2
+                        if dist_sum < min_anchor_sum:
+                            min_anchor_sum = dist_sum
+                except KeyError:
+                    continue
+            
+            if min_anchor_sum < float('inf'):
+                bias = min_anchor_sum - known_dist
+                biases.append(bias)
+
+        if len(biases) >= 3:
+            median_bias = np.median(biases)
+            if median_bias > 100: 
+                sample_bias[s] = median_bias
+                if s in ["ERR3588243", "ERR8170876_ont", "ERR4830684", "ERR8170873_ont", "ERR3806818"]:
+                    print(f"    Bias detected for {s}: {median_bias:.1f} (from {len(biases)} far neighbors)")
+        elif len(biases) > 0:
+             mean_bias = np.mean(biases)
+             if mean_bias > 100:
+                 sample_bias[s] = mean_bias
+                 if s in ["ERR3588243", "ERR8170876_ont", "ERR4830684"]:
+                     print(f"    Bias detected for {s}: {mean_bias:.1f} (from {len(biases)} far neighbor)")
+    
+    print(f"  Detected systematic bias for {len(sample_bias)} samples")
+    return sample_bias
 
 
 def apply_correction(df, factor):
@@ -189,7 +234,7 @@ def diagnose_imputation_coverage(incomplete_matrix, known_mask, anchors, sample_
                 else:
                     cannot_triangulate += 1
                     if cannot_triangulate <= 5:
-                        print(f"\n  Cannot triangulate: {s1} <-> {s2}")
+                        print(f"\n  Cannot triangulate: {s1} and {s2}")
                         for anchor in present_anchors:
                             d1 = incomplete_matrix.loc[s1, anchor]
                             d2 = incomplete_matrix.loc[s2, anchor]
@@ -284,8 +329,11 @@ def enforce_metric_properties_balanced(matrix, known_mask, close_detected_mask=N
 def impute_anchor_guided(incomplete_matrix, known_mask, anchors, sample_to_lab):
 
     print("Using Enhanced Anchor-Guided Imputation")
+
+    debug_pairs = set()
     
     matrix = incomplete_matrix.copy()
+    original_known_mask = known_mask.copy()
     samples = list(matrix.index)
     known = known_mask.copy()
     
@@ -343,6 +391,41 @@ def impute_anchor_guided(incomplete_matrix, known_mask, anchors, sample_to_lab):
                 weight_factors[category] = 0.45
             print(f"  Default weight factor ({category}): {weight_factors[category]:.3f}")
     
+    anchor_calibration = []
+    print("\n  Anchor-based cross-lab calibration:")
+    for i, a1 in enumerate(present_anchors):
+        for a2 in present_anchors[i+1:]:
+            actual_dist = original_matrix.loc[a1, a2]
+            if np.isnan(actual_dist) or actual_dist <= 0:
+                continue
+            
+            p1 = np.array([original_matrix.loc[a1, a] for a in present_anchors if a not in [a1, a2]])
+            p2 = np.array([original_matrix.loc[a2, a] for a in present_anchors if a not in [a1, a2]])
+            valid = ~np.isnan(p1) & ~np.isnan(p2)
+            
+            if valid.sum() >= 3:
+                diffs = np.abs(p1[valid] - p2[valid])
+                max_diff = np.max(diffs)
+                
+                if max_diff > 0:
+                    ratio = actual_dist / max_diff
+                    anchor_calibration.append({
+                        'a1': a1, 'a2': a2,
+                        'max_diff': max_diff,
+                        'actual_dist': actual_dist,
+                        'ratio': ratio
+                    })
+                    if actual_dist < 300:
+                        print(f"    {a1} <-> {a2}: max_diff={max_diff:.0f}, actual={actual_dist:.0f}, ratio={ratio:.1f}x")
+    
+    close_anchor_pairs = [p for p in anchor_calibration if p['max_diff'] < 50 and p['actual_dist'] < 200]
+    if close_anchor_pairs:
+        very_close_multiplier = np.median([p['ratio'] for p in close_anchor_pairs])
+        print(f"  Calibrated very_close_multiplier: {very_close_multiplier:.1f}x (from {len(close_anchor_pairs)} anchor pairs)")
+    else:
+        very_close_multiplier = 6.0
+        print(f"  Default very_close_multiplier: {very_close_multiplier:.1f}x (no close anchor pairs found)")
+    
     sample_profiles = {}
     for s in samples:
         profile = []
@@ -354,6 +437,64 @@ def impute_anchor_guided(incomplete_matrix, known_mask, anchors, sample_to_lab):
                 profile.append(np.nan)
         sample_profiles[s] = np.array(profile)
     
+    ANCHOR_THRESHOLD = 500
+    
+    sample_min_anchor_dist = {}
+    for s in samples:
+        min_dist = float('inf')
+        for anchor in present_anchors:
+            d = original_matrix.loc[s, anchor]
+            if not np.isnan(d) and d > 0:
+                min_dist = min(min_dist, d)
+        sample_min_anchor_dist[s] = min_dist
+    
+    samples_with_close_neighbors = set()
+    CLOSE_NEIGHBOR_THRESHOLD = 200
+    
+    for s in samples:
+        for other in samples:
+            if s == other:
+                continue
+            if original_known.loc[s, other]:
+                d = original_matrix.loc[s, other]
+                if not np.isnan(d) and 0 < d < CLOSE_NEIGHBOR_THRESHOLD:
+                    samples_with_close_neighbors.add(s)
+                    break
+    
+    samples_with_similar_profiles = set()
+    PROFILE_SIMILARITY_THRESHOLD = 30 
+    
+    for s1 in samples:
+        if s1 in samples_with_close_neighbors:
+            continue  
+        profile1 = sample_profiles[s1]
+        for s2 in samples:
+            if s1 == s2 or s2 in samples_with_close_neighbors:
+                continue
+            profile2 = sample_profiles.get(s2, np.array([]))
+            if len(profile1) == len(profile2):
+                diffs = np.abs(profile1 - profile2)
+                valid_mask = ~np.isnan(diffs)
+                if valid_mask.sum() >= 3:
+                    max_diff = np.nanmax(diffs)
+                    if max_diff < PROFILE_SIMILARITY_THRESHOLD:
+                        samples_with_similar_profiles.add(s1)
+                        samples_with_similar_profiles.add(s2)
+                        break
+    
+    far_from_anchors = {s for s, d in sample_min_anchor_dist.items() 
+                        if d > ANCHOR_THRESHOLD 
+                        and s not in samples_with_close_neighbors
+                        and s not in samples_with_similar_profiles}
+    
+    print(f"\n  Anchor-Constrained Insertion: ANCHOR_THRESHOLD = {ANCHOR_THRESHOLD}")
+    print(f"  Samples with close neighbors (<{CLOSE_NEIGHBOR_THRESHOLD} SNPs): {len(samples_with_close_neighbors)}")
+    print(f"  Samples with similar profiles (<{PROFILE_SIMILARITY_THRESHOLD} diff): {len(samples_with_similar_profiles)}")
+    print(f"  Samples truly isolated: {len(far_from_anchors)}")
+    if far_from_anchors:
+        for s in list(far_from_anchors)[:10]:
+            print(f"    {s}: min_anchor_dist = {sample_min_anchor_dist[s]:.0f}")
+    
     all_known_distances = {}
     for s1 in samples:
         all_known_distances[s1] = {}
@@ -364,6 +505,8 @@ def impute_anchor_guided(incomplete_matrix, known_mask, anchors, sample_to_lab):
                 d = original_matrix.loc[s1, s2]
                 if d > 0:
                     all_known_distances[s1][s2] = d
+    
+    sample_bias = calculate_sample_bias(samples, all_known_distances, present_anchors, original_matrix)
     
     print("\n  Building lineage groups from known distances")
     
@@ -439,7 +582,6 @@ def impute_anchor_guided(incomplete_matrix, known_mask, anchors, sample_to_lab):
     close_pairs_to_impute = []
     processed_pairs = set()
     
-    # Multiple passes because some pairs depend on estimates from others
     MAX_PASSES = 3
     
     for pass_num in range(MAX_PASSES):
@@ -476,13 +618,21 @@ def impute_anchor_guided(incomplete_matrix, known_mask, anchors, sample_to_lab):
             consistency_lower = 0
             consistency_upper = float('inf')
             consistency_evidence = []
+            known_consistency_lower = 0
             
             for k in samples:
                 if k == s1 or k == s2:
                     continue
                 
-                d_s1_k = all_known_distances.get(s1, {}).get(k)
-                d_s2_k = all_known_distances.get(s2, {}).get(k)
+                d_s1_k_known = all_known_distances.get(s1, {}).get(k)
+                d_s2_k_known = all_known_distances.get(s2, {}).get(k)
+                if d_s1_k_known is not None and d_s2_k_known is not None:
+                    known_lower = abs(d_s1_k_known - d_s2_k_known)
+                    if known_lower > known_consistency_lower:
+                        known_consistency_lower = known_lower
+                
+                d_s1_k = d_s1_k_known
+                d_s2_k = d_s2_k_known
                 
                 if d_s1_k is None and not np.isnan(matrix.loc[s1, k]) and matrix.loc[s1, k] > 0:
                     d_s1_k = matrix.loc[s1, k]
@@ -513,7 +663,7 @@ def impute_anchor_guided(incomplete_matrix, known_mask, anchors, sample_to_lab):
             effective_upper = min(consistency_upper, anchor_upper) if consistency_upper < float('inf') else anchor_upper
             
             if should_debug:
-                print(f"    Pass {pass_num}: consistency_lower={consistency_lower:.0f}, effective_upper={effective_upper:.0f}")
+                print(f"    Pass {pass_num}: consistency_lower={consistency_lower:.0f}, known_cons_lower={known_consistency_lower:.0f}, effective_upper={effective_upper:.0f}")
                 print(f"    consistency_evidence count={len(consistency_evidence)}")
                 for k, d1, d2, lo, up in consistency_evidence[:3]:
                     print(f"      via {k}: d1={d1:.0f}, d2={d2:.0f}, bounds=[{lo:.0f}, {up:.0f}]")
@@ -523,9 +673,15 @@ def impute_anchor_guided(incomplete_matrix, known_mask, anchors, sample_to_lab):
             same_lineage_group = (s1_root == s2_root)
             
             mean_profile = np.nanmean(np.concatenate([profile1[valid_mask], profile2[valid_mask]]))
+            has_low_consistency_bound = consistency_lower < 200
             
-            is_deep_same_lineage = (mean_profile > 1200 and max_diff < 50 and std_diff < 25)
-            is_potentially_close = (max_diff < 20)
+            s1_min_anchor = sample_min_anchor_dist.get(s1, 0)
+            s2_min_anchor = sample_min_anchor_dist.get(s2, 0)
+            both_deep = (s1_min_anchor > 800 and s2_min_anchor > 800)
+            
+            is_deep_same_lineage = (mean_profile > 1200 and max_diff < 50 and std_diff < 25 
+                                    and has_low_consistency_bound and not both_deep)
+            is_potentially_close = (max_diff < 20 and has_low_consistency_bound and not both_deep)
             
             if should_debug:
                 print(f"    mean_profile={mean_profile:.0f}, max_diff={max_diff:.0f}, std_diff={std_diff:.2f}")
@@ -534,129 +690,236 @@ def impute_anchor_guided(incomplete_matrix, known_mask, anchors, sample_to_lab):
             lineage_estimate = None
             
             if is_cross_lab and is_deep_same_lineage:
-
-                calibration_distances = []
-                if same_lineage_group:
-                    lineage_root = find(s1)
-                    for (root, sa, sb), known_dist in lineage_cross_lab_distances.items():
-                        if root == lineage_root:
-                            calibration_distances.append(known_dist)
-                            if should_debug:
-                                print(f"Same lineage: Found reference {sa}↔{sb} = {known_dist}")
+                s1_far = s1 in far_from_anchors
+                s2_far = s2 in far_from_anchors
+                both_far = s1_far and s2_far
                 
-                if calibration_distances:
-                    lineage_estimate = np.median(calibration_distances)
+                if both_far:
+                    s1_min = sample_min_anchor_dist[s1]
+                    s2_min = sample_min_anchor_dist[s2]
+                    parallel_estimate = s1_min + s2_min
+                    
+                    if s1 in sample_bias or s2 in sample_bias:
+                         correction = (sample_bias.get(s1, 0) + sample_bias.get(s2, 0)) * 0.5
+                         if correction > 0:
+                             parallel_estimate = max(parallel_estimate - correction, effective_lower)
+                             if should_debug:
+                                 print(f"    Bias correction: -{correction:.1f} (s1_bias={sample_bias.get(s1,0):.1f}, s2_bias={sample_bias.get(s2,0):.1f})")
+
+                    if effective_upper < float('inf'):
+                        parallel_estimate = min(parallel_estimate, effective_upper * 0.9)
+                    
+                    lineage_estimate = max(parallel_estimate, effective_lower, 500)
+                    
+                    if should_debug:
+                        print(f"    Both far from anchors")
+                        print(f"    s1_min={s1_min:.0f}, s2_min={s2_min:.0f} to parallel_estimate={lineage_estimate:.0f}")
                 else:
-
-                    lineage_estimate = max(max_diff * 6, effective_lower * 1.1, 80)
-                
-                lineage_estimate = max(lineage_estimate, effective_lower)
+                    calibration_distances = []
+                    if same_lineage_group:
+                        lineage_root = find(s1)
+                        for (root, sa, sb), known_dist in lineage_cross_lab_distances.items():
+                            if root == lineage_root:
+                                calibration_distances.append(known_dist)
+                                if should_debug:
+                                    print(f"Same lineage: Found reference {sa}↔{sb} = {known_dist}")
+                    
+                    if calibration_distances:
+                        lineage_estimate = np.median(calibration_distances)
+                    elif max_diff <= 10 and std_diff < 2:
+                        mult = very_close_multiplier
+                        lineage_estimate = max(max_diff * mult, median_diff * (mult + 1), 30)
+                        if should_debug:
+                            print(f"    max_diff={max_diff:.0f} tight, ignoring effective_lower={effective_lower:.0f}")
+                    elif max_diff <= 15 and std_diff < 4 and known_consistency_lower < 50:
+                        mult = very_close_multiplier - 2
+                        lineage_estimate = max(max_diff * mult, median_diff * (mult + 1), 50)
+                        if should_debug:
+                            print(f"    max_diff={max_diff:.0f}, known_cons={known_consistency_lower:.0f}")
+                            print(f"      Bypassing effective_lower={effective_lower:.0f}, estimate={lineage_estimate:.0f}")
+                    else:
+                        lineage_estimate = max(max_diff * 6, effective_lower * 1.1, 80)
+                    
+                    if not (max_diff <= 10 and std_diff < 2) and not (max_diff <= 15 and std_diff < 4 and known_consistency_lower < 50):
+                        lineage_estimate = max(lineage_estimate, effective_lower)
                 
                 if should_debug:
                     print(f"Same lineage: max_diff={max_diff:.0f}, std_diff={std_diff:.2f}, estimate={lineage_estimate:.0f}")
             
             elif is_cross_lab and is_potentially_close:
+                s1_far = s1 in far_from_anchors
+                s2_far = s2 in far_from_anchors
+                both_far = s1_far and s2_far
+                
+                if both_far:
+                    s1_min = sample_min_anchor_dist[s1]
+                    s2_min = sample_min_anchor_dist[s2]
+                    parallel_estimate = s1_min + s2_min
+                    
+                    if s1 in sample_bias or s2 in sample_bias:
+                         correction = (sample_bias.get(s1, 0) + sample_bias.get(s2, 0)) * 0.5
+                         if correction > 0:
+                             parallel_estimate = max(parallel_estimate - correction, effective_lower)
+                             if should_debug:
+                                 print(f"    Bias correction: -{correction:.1f} (s1_bias={sample_bias.get(s1,0):.1f}, s2_bias={sample_bias.get(s2,0):.1f})")
 
-                close_calibration = []
-                if same_lineage_group:
-                    for other in samples:
-                        if other == s1 or other == s2:
-                            continue
-                        other_labs = set(sample_to_lab.get(other, []))
-                        
-                        if s1_labs & other_labs and known.loc[s1, other]:
-                            d = original_matrix.loc[s1, other]
-                            if 0 < d < 150:
-                                other_profile = sample_profiles.get(other, np.array([]))
-                                if len(other_profile) == len(profile2):
-                                    other_diffs = np.abs(profile2 - other_profile)
-                                    valid = ~np.isnan(other_diffs)
-                                    if valid.sum() >= 3 and np.nanmax(other_diffs) < 25:
-                                        close_calibration.append(d)
-                        
-                        if s2_labs & other_labs and known.loc[s2, other]:
-                            d = original_matrix.loc[s2, other]
-                            if 0 < d < 150:
-                                other_profile = sample_profiles.get(other, np.array([]))
-                                if len(other_profile) == len(profile1):
-                                    other_diffs = np.abs(profile1 - other_profile)
-                                    valid = ~np.isnan(other_diffs)
-                                    if valid.sum() >= 3 and np.nanmax(other_diffs) < 25:
-                                        close_calibration.append(d)
-                
-                if close_calibration:
-                    close_estimate = np.median(close_calibration) + max_diff * 2
+                    if effective_upper < float('inf'):
+                        parallel_estimate = min(parallel_estimate, effective_upper * 0.9)
+                    lineage_estimate = max(parallel_estimate, effective_lower, 400)
+                    if should_debug:
+                        print(f"    POTENTIALLY_CLOSE but ANCHOR-CONSTRAINED: estimate={lineage_estimate:.0f}")
                 else:
-                    close_estimate = max(max_diff * 4, effective_lower * 1.05, 10)
-                
-                close_estimate = max(close_estimate, effective_lower)
-                
-                if should_debug:
-                    print(f"    POTENTIALLY_CLOSE detected: max_diff={max_diff:.0f}, calibration={close_calibration[:3]}, estimate={close_estimate:.0f}")
-                
-                lineage_estimate = close_estimate
+                    close_calibration = []
+                    if same_lineage_group:
+                        for other in samples:
+                            if other == s1 or other == s2:
+                                continue
+                            other_labs = set(sample_to_lab.get(other, []))
+                            
+                            if s1_labs & other_labs and original_known_mask.loc[s1, other]:
+                                d = original_matrix.loc[s1, other]
+                                if 0 < d < 150:
+                                    other_profile = sample_profiles.get(other, np.array([]))
+                                    if len(other_profile) == len(profile2):
+                                        other_diffs = np.abs(profile2 - other_profile)
+                                        valid = ~np.isnan(other_diffs)
+                                        if valid.sum() >= 3 and np.nanmax(other_diffs) < 25:
+                                            close_calibration.append(d)
+                            
+                            if s2_labs & other_labs and original_known_mask.loc[s2, other]:
+                                d = original_matrix.loc[s2, other]
+                                if 0 < d < 150:
+                                    other_profile = sample_profiles.get(other, np.array([]))
+                                    if len(other_profile) == len(profile1):
+                                        other_diffs = np.abs(profile1 - other_profile)
+                                        valid = ~np.isnan(other_diffs)
+                                        if valid.sum() >= 3 and np.nanmax(other_diffs) < 25:
+                                            close_calibration.append(d)
+                    
+                    if close_calibration:
+                        close_estimate = np.median(close_calibration) + max_diff * 2
+                    else:
+                        close_estimate = max(max_diff * 4, effective_lower * 1.05, 10)
+                    
+                    close_estimate = max(close_estimate, effective_lower)
+                    
+                    if should_debug:
+                        print(f"    POTENTIALLY_CLOSE: max_diff={max_diff:.0f}, calibration={close_calibration[:3]}, estimate={close_estimate:.0f}")
+                    
+                    lineage_estimate = close_estimate
             
             elif is_cross_lab and max_diff < 50 and mean_profile > 1500:
+                s1_far = s1 in far_from_anchors
+                s2_far = s2 in far_from_anchors
+                both_far = s1_far and s2_far
                 
-                calibration_distances = []
-                
-                if same_lineage_group:
-                    lineage_root = find(s1)
-                    for (root, sa, sb), known_dist in lineage_cross_lab_distances.items():
-                        if root == lineage_root:
-                            calibration_distances.append(known_dist)
-                            if should_debug:
-                                print(f"    Found lineage cross-lab reference: {sa}↔{sb} = {known_dist}")
-                
-                for other in samples:
-                    if other == s1 or other == s2:
-                        continue
-                    
-                    other_labs = set(sample_to_lab.get(other, []))
-                    if s1_labs & other_labs and known.loc[s1, other]:
-                        d_s1_other = original_matrix.loc[s1, other]
-                        if d_s1_other > 0 and d_s1_other < 400:
-                            other_profile = sample_profiles.get(other, np.array([]))
-                            if len(other_profile) == len(profile2):
-                                other_s2_diffs = np.abs(profile2 - other_profile)
-                                valid_other = ~np.isnan(other_s2_diffs)
-                                if valid_other.sum() >= 3:
-                                    other_s2_max_diff = np.nanmax(other_s2_diffs)
-                                    if other_s2_max_diff < 50:
-                                        calibration_distances.append(d_s1_other)
-                                        if should_debug:
-                                            print(f"    Calibration via {other}: d_s1={d_s1_other:.0f}, profile_diff={other_s2_max_diff:.0f}")
-                    
-                    if s2_labs & other_labs and known.loc[s2, other]:
-                        d_s2_other = original_matrix.loc[s2, other]
-                        if d_s2_other > 0 and d_s2_other < 400:
-                            other_profile = sample_profiles.get(other, np.array([]))
-                            if len(other_profile) == len(profile1):
-                                other_s1_diffs = np.abs(profile1 - other_profile)
-                                valid_other = ~np.isnan(other_s1_diffs)
-                                if valid_other.sum() >= 3:
-                                    other_s1_max_diff = np.nanmax(other_s1_diffs)
-                                    if other_s1_max_diff < 50:
-                                        calibration_distances.append(d_s2_other)
-                                        if should_debug:
-                                            print(f"    Calibration via {other}: d_s2={d_s2_other:.0f}, profile_diff={other_s1_max_diff:.0f}")
-                
-                if calibration_distances:
-                    median_cal = np.median(calibration_distances)
-                    lineage_estimate = median_cal + max_diff * 1.5
-                    lineage_estimate = max(lineage_estimate, effective_lower)
-                    
+                if both_far:
+                    s1_min = sample_min_anchor_dist[s1]
+                    s2_min = sample_min_anchor_dist[s2]
+                    parallel_estimate = s1_min + s2_min
+                    if effective_upper < float('inf'):
+                        parallel_estimate = min(parallel_estimate, effective_upper * 0.9)
+                    lineage_estimate = max(parallel_estimate, effective_lower, 500)
                     if should_debug:
-                        print(f"    MODERATELY_CLOSE with calibration: {calibration_distances[:5]}, estimate={lineage_estimate:.0f}")
+                        print(f"    MODERATELY_CLOSE but ANCHOR-CONSTRAINED: estimate={lineage_estimate:.0f}")
                 else:
-                    if std_diff < 15:
-                        lineage_estimate = max(max_diff * 4, 80)
-                    else:
-                        lineage_estimate = max(max_diff * 5, 100)
-                    lineage_estimate = max(lineage_estimate, effective_lower)
+                    calibration_distances = []
+                    
+                    s1_anchor_dist = sample_min_anchor_dist.get(s1, 0)
+                    s2_anchor_dist = sample_min_anchor_dist.get(s2, 0)
+                    either_deep = (s1_anchor_dist > 800 or s2_anchor_dist > 800)
                     
                     if should_debug:
-                        print(f"    MODERATELY_CLOSE fallback: estimate={lineage_estimate:.0f}")
+                        print(f"    s1_anchor_dist={s1_anchor_dist:.0f}, s2_anchor_dist={s2_anchor_dist:.0f}, either_deep={either_deep}")
+                    
+                    if same_lineage_group:
+                        lineage_root = find(s1)
+                        for (root, sa, sb), known_dist in lineage_cross_lab_distances.items():
+                            if root == lineage_root:
+                                calibration_distances.append(known_dist)
+                                if should_debug:
+                                    print(f"    Found lineage cross-lab reference: {sa}↔{sb} = {known_dist}")
+                    
+                    if not either_deep:
+                        for other in samples:
+                            if other == s1 or other == s2:
+                                continue
+                            
+                            other_labs = set(sample_to_lab.get(other, []))
+                            if s1_labs & other_labs and known.loc[s1, other]:
+                                d_s1_other = original_matrix.loc[s1, other]
+                                if d_s1_other > 0 and d_s1_other < 400:
+                                    other_profile = sample_profiles.get(other, np.array([]))
+                                    if len(other_profile) == len(profile2):
+                                        other_s2_diffs = np.abs(profile2 - other_profile)
+                                        valid_other = ~np.isnan(other_s2_diffs)
+                                        if valid_other.sum() >= 3:
+                                            other_s2_max_diff = np.nanmax(other_s2_diffs)
+                                            if other_s2_max_diff < 50:
+                                                calibration_distances.append(d_s1_other)
+                                                if should_debug:
+                                                    print(f"    Calibration via {other}: d_s1={d_s1_other:.0f}, profile_diff={other_s2_max_diff:.0f}")
+                            
+                            if s2_labs & other_labs and known.loc[s2, other]:
+                                d_s2_other = original_matrix.loc[s2, other]
+                                if d_s2_other > 0 and d_s2_other < 400:
+                                    other_profile = sample_profiles.get(other, np.array([]))
+                                    if len(other_profile) == len(profile1):
+                                        other_s1_diffs = np.abs(profile1 - other_profile)
+                                        valid_other = ~np.isnan(other_s1_diffs)
+                                        if valid_other.sum() >= 3:
+                                            other_s1_max_diff = np.nanmax(other_s1_diffs)
+                                            if other_s1_max_diff < 50:
+                                                calibration_distances.append(d_s2_other)
+                                                if should_debug:
+                                                    print(f"    Calibration via {other}: d_s2={d_s2_other:.0f}, profile_diff={other_s1_max_diff:.0f}")
+                    else:
+                        if should_debug:
+                            print(f"    SKIPPING calibration")
+                    
+                    if calibration_distances:
+                        median_cal = np.median(calibration_distances)
+                        lineage_estimate = median_cal + max_diff * 1.5
+                        lineage_estimate = max(lineage_estimate, effective_lower)
+                        
+                        if should_debug:
+                            print(f"    MODERATELY_CLOSE with calibration: {calibration_distances[:5]}, estimate={lineage_estimate:.0f}")
+                    else:
+
+                        both_deep_local = (s1_anchor_dist > 800 and s2_anchor_dist > 800)
+
+                        has_loose_bounds = effective_upper > 1000 and std_diff > 2
+                        is_deep_parallel = both_deep_local and (consistency_lower > 400 or has_loose_bounds)
+                        
+                        if should_debug:
+                            print(f"    both_deep={both_deep_local}, consistency_lower={consistency_lower:.0f}")
+                            print(f"      effective_upper={effective_upper:.0f}, std_diff={std_diff:.2f}, has_loose_bounds={has_loose_bounds}")
+                            print(f"      is_deep_parallel={is_deep_parallel}")
+                        
+                        if is_deep_parallel:
+                            anchor_sum_estimate = (s1_anchor_dist + s2_anchor_dist) * 0.4
+                            anchor_sum_estimate = max(anchor_sum_estimate, 400)
+                            lineage_estimate = max(anchor_sum_estimate, effective_lower)
+                            if should_debug:
+                                print(f"    MODERATELY_CLOSE (BOTH_DEEP + INCONSISTENT): anchor_sum_estimate={anchor_sum_estimate:.0f}")
+                                print(f"      s1_anchor_dist={s1_anchor_dist:.0f}, s2_anchor_dist={s2_anchor_dist:.0f}")
+                                print(f"      consistency_lower={consistency_lower:.0f}")
+                        elif max_diff <= 10 and std_diff < 2.0 and not both_deep_local:
+                            mult = very_close_multiplier  
+                            lineage_estimate = max(max_diff * mult, median_diff * (mult + 1), 30)
+                            if should_debug:
+                                print(f"    MODERATELY_CLOSE PROFILE-PRIORITY: max_diff={max_diff:.0f}, std_diff={std_diff:.2f}")
+                                print(f"      Bypassing effective_lower={effective_lower:.0f}, estimate={lineage_estimate:.0f}")
+                        elif std_diff < 15:
+                            lineage_estimate = max(max_diff * 4, 40)
+                        else:
+                            lineage_estimate = max(max_diff * 5, 50)
+                        
+                        if both_deep_local or max_diff > 10 or std_diff >= 2.0:
+                            lineage_estimate = max(lineage_estimate, effective_lower)
+                        
+                        if should_debug:
+                            print(f"    MODERATELY_CLOSE fallback: estimate={lineage_estimate:.0f}")
             
             if lineage_estimate is not None:
                 close_pairs_to_impute.append((s1, s2, lineage_estimate, f"LINEAGE_PROXY_PASS{pass_num}"))
@@ -693,8 +956,8 @@ def impute_anchor_guided(incomplete_matrix, known_mask, anchors, sample_to_lab):
                     continue
                 
                 if max_diff < 5 and small_diff_ratio >= 0.95 and effective_lower < 30:
-                    mult = 6.0
-                    close_estimate = max(max_diff * mult, median_diff * 7, effective_lower * 1.2, 30)
+                    mult = 2.0
+                    close_estimate = max(max_diff * mult, median_diff * 2, effective_lower * 1.05, 5)
                     close_pairs_to_impute.append((s1, s2, close_estimate, "VERY_CLOSE"))
                     processed_pairs.add((s1, s2))
                     matrix.loc[s1, s2] = close_estimate
@@ -705,8 +968,8 @@ def impute_anchor_guided(incomplete_matrix, known_mask, anchors, sample_to_lab):
                     known.loc[s2, s1] = True
                 
                 elif max_diff < 15 and small_diff_ratio >= 0.90 and effective_lower < 75:
-                    mult = 5.0
-                    close_estimate = max(max_diff * mult, mean_diff * 6, effective_lower * 1.1, 50)
+                    mult = 2.0  
+                    close_estimate = max(max_diff * mult, mean_diff * 2, effective_lower * 1.02, 10)
                     close_pairs_to_impute.append((s1, s2, close_estimate, "CLOSE"))
                     processed_pairs.add((s1, s2))
                     matrix.loc[s1, s2] = close_estimate
@@ -739,6 +1002,202 @@ def impute_anchor_guided(incomplete_matrix, known_mask, anchors, sample_to_lab):
         category_counts[category] = category_counts.get(category, 0) + 1
     print(f"  Category breakdown: {category_counts}")
 
+    correction_count = 0
+    for i, (s1, s2, estimate, category) in enumerate(close_pairs_to_impute):
+        if not category.startswith("LINEAGE_PROXY"):
+            continue
+        p1 = sample_profiles.get(s1, np.array([]))
+        p2 = sample_profiles.get(s2, np.array([]))
+        if len(p1) == 0 or len(p2) == 0 or len(p1) != len(p2):
+            continue
+        valid = ~np.isnan(p1) & ~np.isnan(p2)
+        if valid.sum() < 3:
+            continue
+        diffs_arr = np.abs(p1[valid] - p2[valid])
+        pair_max_diff = np.max(diffs_arr)
+        
+        if pair_max_diff > 15 and pair_max_diff <= 30:
+            adaptive_mult = max(12, pair_max_diff * 0.5)
+            new_estimate = max(pair_max_diff * adaptive_mult, estimate)
+            if new_estimate > estimate:
+                should_debug = (s1, s2) in debug_pairs
+                if should_debug:
+                    print(f"  POST-CORRECTION: {s1} and {s2}: max_diff={pair_max_diff:.0f}, {estimate:.0f} -> {new_estimate:.0f}")
+                matrix.loc[s1, s2] = new_estimate
+                matrix.loc[s2, s1] = new_estimate
+                close_pairs_to_impute[i] = (s1, s2, new_estimate, category)
+                correction_count += 1
+    if correction_count > 0:
+        print(f"  Post-lineage-proxy correction: {correction_count} pairs adjusted")
+
+    crosslab_very_close = []
+    for s1, s2 in missing_pairs:
+        if (s1, s2) in processed_pairs or (s2, s1) in processed_pairs:
+            continue
+        
+        s1_labs = set(sample_to_lab.get(s1, []))
+        s2_labs = set(sample_to_lab.get(s2, []))
+        is_cross_lab = not bool(s1_labs & s2_labs)
+        
+        if not is_cross_lab:
+            continue
+        
+        profile1 = sample_profiles.get(s1, np.array([]))
+        profile2 = sample_profiles.get(s2, np.array([]))
+        if len(profile1) == 0 or len(profile2) == 0 or len(profile1) != len(profile2):
+            continue
+        valid_mask = ~np.isnan(profile1) & ~np.isnan(profile2)
+        if valid_mask.sum() < 3:
+            continue
+        diffs = np.abs(profile1[valid_mask] - profile2[valid_mask])
+        max_diff = np.max(diffs)
+        std_diff = np.std(diffs)
+        median_diff = np.median(diffs)
+        
+        small_diff_count = np.sum(diffs < 100)
+        small_diff_ratio = small_diff_count / len(diffs)
+        
+        if max_diff > 10 or std_diff >= 2.9 or small_diff_ratio < 0.85:
+            continue
+        
+        known_cons_lower = 0
+        for k in samples:
+            if k == s1 or k == s2:
+                continue
+            d_s1_k = all_known_distances.get(s1, {}).get(k)
+            d_s2_k = all_known_distances.get(s2, {}).get(k)
+            if d_s1_k is not None and d_s2_k is not None:
+                lower = abs(d_s1_k - d_s2_k)
+                if lower > known_cons_lower:
+                    known_cons_lower = lower
+        
+        s1_min_anchor = sample_min_anchor_dist.get(s1, 0)
+        s2_min_anchor = sample_min_anchor_dist.get(s2, 0)
+        both_deep = (s1_min_anchor > 800 and s2_min_anchor > 800)
+        
+        should_debug_vc = (s1, s2) in debug_pairs
+        if should_debug_vc:
+            print(f"  CROSSLAB_VERY_CLOSE check: {s1} and {s2}")
+            print(f"    max_diff={max_diff:.0f}, std_diff={std_diff:.2f}, small_ratio={small_diff_ratio:.2f}, known_cons_lower={known_cons_lower:.0f}, both_deep={both_deep}")
+        
+        if known_cons_lower < 50 and not both_deep:
+            mult = very_close_multiplier
+            close_estimate = max(max_diff * mult, median_diff * (mult + 1), known_cons_lower * 1.2, 30)
+            
+            crosslab_very_close.append((s1, s2, close_estimate))
+            processed_pairs.add((s1, s2))
+            matrix.loc[s1, s2] = close_estimate
+            matrix.loc[s2, s1] = close_estimate
+            close_detected_mask.loc[s1, s2] = True
+            close_detected_mask.loc[s2, s1] = True
+            known.loc[s1, s2] = True
+            known.loc[s2, s1] = True
+            imputation_stats["profile_very_close"] = imputation_stats.get("profile_very_close", 0) + 1
+            
+            if should_debug_vc:
+                print(f"    estimate={close_estimate:.0f}")
+    
+    print(f"  Cross-lab VERY_CLOSE detected: {len(crosslab_very_close)}")
+
+    neighbor_bridge_count = 0
+    
+    for s1, s2 in missing_pairs:
+        if (s1, s2) in processed_pairs or (s2, s1) in processed_pairs:
+            continue
+        
+        s1_labs = set(sample_to_lab.get(s1, []))
+        s2_labs = set(sample_to_lab.get(s2, []))
+        is_cross_lab = not bool(s1_labs & s2_labs)
+        if not is_cross_lab:
+            continue
+        
+        profile1 = sample_profiles.get(s1, np.array([]))
+        profile2 = sample_profiles.get(s2, np.array([]))
+        if len(profile1) == 0 or len(profile2) == 0 or len(profile1) != len(profile2):
+            continue
+        valid_mask = ~np.isnan(profile1) & ~np.isnan(profile2)
+        if valid_mask.sum() < 3:
+            continue
+        diffs = np.abs(profile1[valid_mask] - profile2[valid_mask])
+        max_diff = np.max(diffs)
+        std_diff = np.std(diffs)
+        
+        if max_diff > 25 or std_diff >= 2.9:
+            continue
+        
+        should_debug_nb = (s1, s2) in debug_pairs
+        
+        bridge_estimates = []
+        bridge_d_neighbor_other = []
+        
+        for target, other in [(s1, s2), (s2, s1)]:
+            target_labs = set(sample_to_lab.get(target, []))
+            for neighbor in samples:
+                if neighbor == target or neighbor == other:
+                    continue
+                neighbor_labs = set(sample_to_lab.get(neighbor, []))
+                if not bool(target_labs & neighbor_labs):
+                    continue
+                if not original_known_mask.loc[target, neighbor]:
+                    continue
+                d_target_neighbor = original_matrix.loc[target, neighbor]
+                if pd.isna(d_target_neighbor) or d_target_neighbor > 150:
+                    continue
+                
+                is_orig = original_known_mask.loc[neighbor, other]
+                is_close_detected = close_detected_mask.loc[neighbor, other]
+                if not (is_orig or is_close_detected):
+                    continue
+                    
+                if is_orig:
+                    d_neighbor_other = original_matrix.loc[neighbor, other]
+                else:
+                    d_neighbor_other = matrix.loc[neighbor, other]
+                    
+                if pd.isna(d_neighbor_other):
+                    continue
+
+                bridge_est = d_neighbor_other + d_target_neighbor  
+                bridge_lower = abs(d_neighbor_other - d_target_neighbor)
+                bridge_est = (bridge_lower + d_neighbor_other + d_target_neighbor) / 2 
+                
+                src_type = "orig" if is_orig else "close"
+                bridge_estimates.append(bridge_est)
+                bridge_d_neighbor_other.append(d_neighbor_other)
+                
+                if should_debug_nb:
+                    print(f"  NEIGHBOR-BRIDGE: {target}->{neighbor}(d={d_target_neighbor:.0f})->{other}(d={d_neighbor_other:.0f} [{src_type}]), est={bridge_est:.0f}")
+        
+        if bridge_estimates and len(bridge_estimates) >= 2:
+            close_bridges = [est for est, d_no in zip(bridge_estimates, bridge_d_neighbor_other) if d_no < 150]
+            
+            if len(close_bridges) >= 2:
+                final_estimate = np.median(close_bridges)
+                if should_debug_nb:
+                    print(f"  NEIGHBOR-BRIDGE: using {len(close_bridges)}/{len(bridge_estimates)} close bridges")
+            else:
+                final_estimate = np.median(bridge_estimates)
+            
+            if np.std(bridge_estimates) > 100:
+                if should_debug_nb:
+                    print(f"  NEIGHBOR-BRIDGE SKIPPED: high variance {np.std(bridge_estimates):.0f}")
+                continue
+            
+            if should_debug_nb:
+                print(f"  NEIGHBOR-BRIDGE FINAL: {s1} <-> {s2}, bridges={len(bridge_estimates)}, estimate={final_estimate:.0f}")
+            
+            processed_pairs.add((s1, s2))
+            matrix.loc[s1, s2] = final_estimate
+            matrix.loc[s2, s1] = final_estimate
+            close_detected_mask.loc[s1, s2] = True
+            close_detected_mask.loc[s2, s1] = True
+            known.loc[s1, s2] = True
+            known.loc[s2, s1] = True
+            neighbor_bridge_count += 1
+            imputation_stats["neighbor_bridge"] = imputation_stats.get("neighbor_bridge", 0) + 1
+    
+    print(f"  Neighbor-bridge estimated: {neighbor_bridge_count}")
+
     remaining_pairs = []
     for s1, s2 in missing_pairs:
         if (s1, s2) not in processed_pairs and (s2, s1) not in processed_pairs:
@@ -759,15 +1218,45 @@ def impute_anchor_guided(incomplete_matrix, known_mask, anchors, sample_to_lab):
         s2_root = find(s2)
         same_lineage_group = (s1_root == s2_root)
         
+        known_cons_lower = 0
+        cons_lower_with_imputed = 0
+        for k in samples:
+            if k == s1 or k == s2:
+                continue
+            d_s1_k_known = all_known_distances.get(s1, {}).get(k)
+            d_s2_k_known = all_known_distances.get(s2, {}).get(k)
+            if d_s1_k_known is not None and d_s2_k_known is not None:
+                lower = abs(d_s1_k_known - d_s2_k_known)
+                if lower > known_cons_lower:
+                    known_cons_lower = lower
+            d_s1_k = d_s1_k_known
+            if d_s1_k is None and not np.isnan(matrix.loc[s1, k]) and matrix.loc[s1, k] > 0:
+                d_s1_k = matrix.loc[s1, k]
+            d_s2_k = d_s2_k_known
+            if d_s2_k is None and not np.isnan(matrix.loc[s2, k]) and matrix.loc[s2, k] > 0:
+                d_s2_k = matrix.loc[s2, k]
+            if d_s1_k is not None and d_s2_k is not None:
+                lower = abs(d_s1_k - d_s2_k)
+                if lower > cons_lower_with_imputed:
+                    cons_lower_with_imputed = lower
+        
+        consistency_lower = known_cons_lower
+        
+        s1_min_anchor = sample_min_anchor_dist.get(s1, 0)
+        s2_min_anchor = sample_min_anchor_dist.get(s2, 0)
+        both_deep = (s1_min_anchor > 800 and s2_min_anchor > 800)
+        
         if valid_mask.sum() >= 3:
             diffs = np.abs(profile1[valid_mask] - profile2[valid_mask])
             max_diff = np.max(diffs)
             std_diff = np.std(diffs)
             mean_profile = np.nanmean(np.concatenate([profile1[valid_mask], profile2[valid_mask]]))
-            is_deep_same_lineage = (mean_profile > 1200 and max_diff < 50 and std_diff < 25)
+            is_deep_same_lineage = (mean_profile > 1200 and max_diff < 50 and std_diff < 25 
+                                    and has_low_consistency_bound and not both_deep)
         else:
             is_deep_same_lineage = False
             max_diff = 0
+            mean_profile = 0
         
         if valid_mask.sum() >= 3:
             diffs = np.abs(profile1[valid_mask] - profile2[valid_mask])
@@ -779,33 +1268,74 @@ def impute_anchor_guided(incomplete_matrix, known_mask, anchors, sample_to_lab):
             small_count = np.sum(diffs < 100)
             small_ratio = small_count / len(diffs)
             
-            if median_diff < 50 and small_ratio >= 0.7:
-                close_estimate = min_diff + 0.1 * (median_diff - min_diff)
-                close_estimate = max(close_estimate, 20)
-                estimates.append(close_estimate)
-                weights.append(10.0)
-                imputation_stats["phylo_close"] += 1
+            can_be_close = has_low_consistency_bound and not both_deep
+            
+            if can_be_close:
+                if median_diff < 50 and small_ratio >= 0.7:
+                    close_estimate = min_diff + 0.1 * (median_diff - min_diff)
+                    close_estimate = max(close_estimate, 20)
+                    estimates.append(close_estimate)
+                    weights.append(10.0)
+                    imputation_stats["phylo_close"] += 1
+                    
+                elif median_diff < 100 and small_ratio >= 0.5:
+                    close_estimate = min_diff + 0.2 * (mean_diff - min_diff)
+                    close_estimate = max(close_estimate, 30)
+                    estimates.append(close_estimate)
+                    weights.append(5.0)
+                    imputation_stats["phylo_close"] += 1
+                    
+                elif median_diff < 200 and small_ratio >= 0.4:
+                    close_estimate = median_diff + 0.15 * (mean_diff - median_diff)
+                    close_estimate = max(close_estimate, min_diff)
+                    estimates.append(close_estimate)
+                    weights.append(3.0)
+                    imputation_stats["phylo_close"] += 1
+            
+            elif both_deep and max_diff < 50 and mean_profile > 1200:
+                parallel_estimate = s1_min_anchor + s2_min_anchor
                 
-            elif median_diff < 100 and small_ratio >= 0.5:
-                close_estimate = min_diff + 0.2 * (mean_diff - min_diff)
-                close_estimate = max(close_estimate, 30)
-                estimates.append(close_estimate)
+                if s1 in sample_bias or s2 in sample_bias:
+                    corr = (sample_bias.get(s1, 0) + sample_bias.get(s2, 0)) * 0.1
+                    if corr > 0:
+                        parallel_estimate = max(parallel_estimate - corr, effective_lower)
+                        if should_debug:
+                             print(f"    Bias correction (Deep): -{corr:.1f}")
+
+                parallel_estimate = max(parallel_estimate * 0.3, 400)
+                estimates.append(parallel_estimate)
                 weights.append(5.0)
-                imputation_stats["phylo_close"] += 1
-                
-            elif median_diff < 200 and small_ratio >= 0.4:
-                close_estimate = median_diff + 0.15 * (mean_diff - median_diff)
-                close_estimate = max(close_estimate, min_diff)
-                estimates.append(close_estimate)
-                weights.append(3.0)
-                imputation_stats["phylo_close"] += 1
+                imputation_stats["deep_parallel"] = imputation_stats.get("deep_parallel", 0) + 1
+        
+        lineage_cons_lower = consistency_lower
+        s1_in_group = find(s1) in lineage_groups
+
+
+        s2_in_group = find(s2) in lineage_groups
+        if s1_in_group or s2_in_group:
+            for lg_root in [find(s1), find(s2)]:
+                if lg_root in lineage_groups:
+                    lg_members = lineage_groups[lg_root]
+                    if len(lg_members) >= 2:
+                        for member in lg_members:
+                            if member == s1 or member == s2:
+                                continue
+                            d_s1_m = matrix.loc[s1, member] if s1 in matrix.index and member in matrix.columns else np.nan
+                            d_s2_m = matrix.loc[s2, member] if s2 in matrix.index and member in matrix.columns else np.nan
+                            if not np.isnan(d_s1_m) and not np.isnan(d_s2_m) and d_s1_m > 0 and d_s2_m > 0:
+                                lower = abs(d_s1_m - d_s2_m)
+                                if lower > lineage_cons_lower:
+                                    lineage_cons_lower = lower
+        
+        
+        very_close_detected = False
         
         lower_bounds = []
         upper_bounds = []
         
         for anchor in present_anchors:
-            d1 = original_known.loc[s1, anchor]
-            d2 = original_known.loc[s2, anchor]
+            d1 = original_matrix.loc[s1, anchor]
+            d2 = original_matrix.loc[s2, anchor]
             
             if not np.isnan(d1) and not np.isnan(d2) and d1 > 0 and d2 > 0:
                 lower = abs(d1 - d2)
@@ -813,7 +1343,7 @@ def impute_anchor_guided(incomplete_matrix, known_mask, anchors, sample_to_lab):
                 lower_bounds.append(lower)
                 upper_bounds.append(upper)
         
-        if lower_bounds:
+        if lower_bounds and not very_close_detected:
             max_lower = max(lower_bounds)
             min_upper = min(upper_bounds)
             
@@ -838,6 +1368,11 @@ def impute_anchor_guided(incomplete_matrix, known_mask, anchors, sample_to_lab):
                     upper = d1 + d2
                     
                     estimate = lower + current_weight * (upper - lower)
+                    
+                    if s1 in sample_bias or s2 in sample_bias:
+                        corr = (sample_bias.get(s1, 0) + sample_bias.get(s2, 0)) * 0.1
+                        if corr > 0:
+                            estimate = max(estimate - corr, lower)
                     
                     balance = 1.0 - abs(d1 - d2) / (d1 + d2)
                     weight = 0.5 + 0.5 * balance
@@ -889,12 +1424,54 @@ def impute_anchor_guided(incomplete_matrix, known_mask, anchors, sample_to_lab):
                 if lower > effective_lower:
                     effective_lower = lower
         
+        if very_close_detected and estimates:
+            profile_estimate = estimates[0]
+            imputed = max(profile_estimate, effective_lower)
+            matrix.loc[s1, s2] = imputed
+            matrix.loc[s2, s1] = imputed
+            close_detected_mask.loc[s1, s2] = True
+            close_detected_mask.loc[s2, s1] = True
+            if should_debug:
+                print(f"  DEBUG remaining_pairs: {s1} and {s2}")
+                print(f"    VERY CLOSE DIRECT: profile_estimate={profile_estimate:.0f}, eff_lower={effective_lower:.0f}, final={imputed:.0f}")
+            continue  
+        
         if estimates:
             weights = np.array(weights)
             weights = weights / weights.sum()
             imputed = np.average(estimates, weights=weights)
             
             imputed = max(imputed, effective_lower)
+            
+            if should_debug:
+                print(f"  DEBUG remaining_pairs: {s1} and {s2}")
+                print(f"    s1_min_anchor={s1_min_anchor:.0f}, s2_min_anchor={s2_min_anchor:.0f}")
+                print(f"    both_deep={both_deep}, imputed_before_floor={imputed:.0f}")
+            
+            is_very_close_candidate = (max_diff < 12 and consistency_lower < 50 and 
+                                       effective_lower < 50 and cons_lower_with_imputed < 200)
+            if is_very_close_candidate and imputed > 100:
+                very_close_estimate = max_diff * 2 + 10
+                if should_debug:
+                    print(f"    VERY CLOSE OVERRIDE: imputed={imputed:.0f} -> {very_close_estimate:.0f} (max_diff={max_diff:.0f}, imputed_cons={cons_lower_with_imputed:.0f})")
+                imputed = very_close_estimate
+                imputation_stats["phylo_close"] += 1
+            
+            if both_deep:
+                sum_anchor_min = s1_min_anchor + s2_min_anchor
+                if s1 in sample_bias or s2 in sample_bias:
+                     corr = (sample_bias.get(s1, 0) + sample_bias.get(s2, 0)) * 0.1
+                     if corr > 0:
+                         sum_anchor_min = max(sum_anchor_min - corr, 0)
+                
+                parallel_floor = max(sum_anchor_min, 800) * 0.4
+                parallel_floor = max(parallel_floor, 400)
+                if should_debug:
+                    print(f"    parallel_floor={parallel_floor:.0f}")
+                if imputed < parallel_floor:
+                    imputed = parallel_floor
+                    if should_debug:
+                        print(f"    Applied floor: imputed={imputed:.0f}")
             
             if same_lineage_group:
                 lineage_root = find(s1)
@@ -915,6 +1492,18 @@ def impute_anchor_guided(incomplete_matrix, known_mask, anchors, sample_to_lab):
             
             matrix.loc[s1, s2] = imputed
             matrix.loc[s2, s1] = imputed
+
+            known_suggests_close = consistency_lower < 50
+            imputed_also_suggests_close = consistency_lower < 100 and cons_lower_with_imputed < 200
+            is_truly_close = (max_diff < 12 and imputed < 100 and effective_lower < 50 and 
+                             (known_suggests_close or imputed_also_suggests_close))
+            if is_truly_close:
+                close_detected_mask.loc[s1, s2] = True
+                close_detected_mask.loc[s2, s1] = True
+                if should_debug:
+                    print(f"    PROTECTED as close (max_diff={max_diff:.0f}, imputed={imputed:.0f}, eff_lower={effective_lower:.0f}, known_cons={consistency_lower:.0f}, imputed_cons={cons_lower_with_imputed:.0f})")
+            elif should_debug and max_diff < 20:
+                print(f"    NOT protected (max_diff={max_diff:.0f}, imputed={imputed:.0f}, eff_lower={effective_lower:.0f}, known_cons={consistency_lower:.0f}, imputed_cons={cons_lower_with_imputed:.0f})")
         else:
             imputation_stats["fallback"] += 1
             known_vals = original_known.values[known.values & (original_known.values > 0)]
@@ -1158,6 +1747,70 @@ def main():
         args.matrices, anchors, args.primary_anchor, args.method
     )
     
+    print("\n" + "=" * 60)
+    print("PCA SVD Denoising")
+    print("=" * 60)
+    print("Loading original matrices")
+    known_mask = pd.DataFrame(False, index=global_matrix.index, columns=global_matrix.columns)
+    
+    for mat_file in args.matrices:
+        abs_path = os.path.abspath(mat_file)
+        print(f"  Processing {mat_file} (Absolute: {abs_path})")
+        if not os.path.exists(mat_file):
+             print(f"  ERROR: File does not exist: {mat_file}")
+             continue
+             
+        try:
+            lab_mat = pd.read_csv(mat_file, sep='\t', index_col=0)
+            common_idx = global_matrix.index.intersection(lab_mat.index)
+            common_col = global_matrix.columns.intersection(lab_mat.columns)
+            
+            lab_aligned = lab_mat.reindex(index=global_matrix.index, columns=global_matrix.columns)
+            known_in_lab = lab_aligned.notnull()
+            
+            known_in_lab = known_in_lab.fillna(False)
+            
+            known_mask = known_mask | known_in_lab
+            
+            print(f"    Loaded {lab_mat.shape} : Aligned {known_in_lab.sum().sum()} knowns")
+            
+        except Exception as e:
+            print(f"  Could not load {mat_file} for mask: {e}")
+            import traceback
+            traceback.print_exc()
+
+    known_count = known_mask.sum().sum()
+    print(f"  Preserving {known_count} known values")
+
+    if global_matrix.isnull().values.any():
+        global_matrix = global_matrix.fillna(global_matrix.mean().mean())
+
+    U, S, Vt = np.linalg.svd(global_matrix, full_matrices=False)
+    
+    min_dim = min(global_matrix.shape)
+    rank = min(10, int(min_dim * 0.5))
+    rank = max(2, rank)
+    print(f"  Truncating to {rank}")
+    S_trunc = np.zeros_like(S)
+    S_trunc[:rank] = S[:rank]
+    
+    M_reconst = np.dot(U * S_trunc, Vt)
+    M_clean = pd.DataFrame(M_reconst, index=global_matrix.index, columns=global_matrix.columns)
+    
+    print("  Applying Hybrid Protection (if < 500)")
+    mask_close = global_matrix < 500
+    M_clean[mask_close] = global_matrix[mask_close]
+    
+    print("  Resetting known values")
+    M_final = M_clean.mask(known_mask, global_matrix)
+    
+    M_final = (M_final + M_final.T) / 2.0
+    np.fill_diagonal(M_final.values, 0)
+    M_final[M_final < 0] = 0
+    
+    global_matrix = M_final
+    print("  Denoising complete.\n")
+
     global_matrix.to_csv(args.output, sep='\t')
     print(f"\nGlobal matrix saved to {args.output}")
     
