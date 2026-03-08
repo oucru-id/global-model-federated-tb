@@ -3,8 +3,9 @@
 nextflow.enable.dsl = 2
 
 log.info """
-    Mycobacterium tuberculosis Federated Phylogeny (Central Node) Version: ${params.version}
-    Developed by SPHERES Lab Team
+    Mycobacterium tuberculosis Federated Phylogenetic (Central Node) 
+    Version: ${params.version}
+    Developed by SPHERES OUCRU-ID Team
 """
 
 include { FEDERATED_MERGE }  from './workflows/federated_merge.nf'
