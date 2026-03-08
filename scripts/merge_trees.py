@@ -341,7 +341,7 @@ def calculate_merge_statistics(tree_files, output_file, global_matrix, outgroup)
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Merge phylogenetic trees using NJ algorithm with outgroup rooting"
+        description="Merge phylogenetic trees using NJ with outgroup rooting"
     )
     parser.add_argument('--trees', nargs='+', required=True, help="Input tree files")
     parser.add_argument('--matrix', type=str, required=True, help="Global distance matrix")
@@ -350,7 +350,7 @@ def main():
     parser.add_argument('--output', type=str, default="global_tree.nwk", help="Output tree file")
     parser.add_argument('--stats', type=str, default="merge_stats.json", help="Output stats file")
     parser.add_argument('--outgroup', type=str, default="ERR4872250", 
-                        help="Outgroup for rooting (default: ERR4872250, Lineage 5)")
+                        help="Outgroup for rooting (default:Lineage 5)")
     parser.add_argument('--normalize', type=str, default='max', choices=['none', 'max', 'genome'],
                         help="Distance normalization method (default: max)")
     args = parser.parse_args()
