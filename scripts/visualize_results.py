@@ -24,30 +24,52 @@ def generate_network(df, meta_df, threshold, output_file):
         else:
             title_html = sample
 
-        G.add_node(sample, title=title_html, label=sample)
+        G.add_node(sample, title=title_html, label=sample,
+                   size=25, borderWidth=2, borderWidthSelected=3)
     
     samples = df.index.tolist()
     for i in range(len(samples)):
         for j in range(i + 1, len(samples)):
             s1 = samples[i]
             s2 = samples[j]
-            dist = df.iloc[i, j]
+            dist = int(df.iloc[i, j])
             
             if dist <= threshold:
-                weight = 1.0 / (dist + 1)
-                G.add_edge(s1, s2, weight=weight, title=f"{dist:.1f} SNPs", label=f"{dist:.0f}")
+                G.add_edge(s1, s2, title=f"{dist} SNPs", label=str(dist),
+                           font={"size": 12, "align": "middle"},
+                           color={"color": "#888888", "opacity": 0.6},
+                           width=max(1, 4 - dist * 0.3))
 
-    net = Network(height="750px", width="100%", bgcolor="#ffffff", font_color="black")
+    net = Network(height="750px", width="100%", bgcolor="#ffffff",
+                  font_color="black", cdn_resources='in_line')
     net.from_nx(G)
     
     net.set_options("""
     var options = {
+      "nodes": {
+        "shape": "dot",
+        "font": { "size": 14, "face": "arial" },
+        "shadow": true
+      },
+      "edges": {
+        "smooth": { "type": "continuous" },
+        "font": { "size": 12, "align": "middle" },
+        "shadow": false
+      },
       "physics": {
         "barnesHut": {
-          "gravitationalConstant": -8000,
-          "springLength": 250,
-          "springConstant": 0.04
-        }
+          "gravitationalConstant": -10000,
+          "centralGravity": 0.3,
+          "springLength": 200,
+          "springConstant": 0.05,
+          "damping": 0.09
+        },
+        "minVelocity": 0.75
+      },
+      "interaction": {
+        "hover": true,
+        "tooltipDelay": 100,
+        "navigationButtons": true
       }
     }
     """)
@@ -99,7 +121,27 @@ def generate_plots(df, output_prefix):
 
 
 def plot_rectangular_tree(tree, output_file):
-    fig = plt.figure(figsize=(15, 12))
+    n_terminals = len(tree.get_terminals())
+
+    if n_terminals <= 50:
+        fig_height = 12
+        label_size = 10
+        marker_size = 80
+        show_branch_labels = True
+    elif n_terminals <= 150:
+        fig_height = max(15, n_terminals * 0.3)
+        label_size = 8
+        marker_size = 50
+        show_branch_labels = True
+    else:
+        fig_height = max(20, n_terminals * 0.25)
+        label_size = 6
+        marker_size = 30
+        show_branch_labels = False
+
+    fig_width = max(15, fig_height * 0.6)
+
+    fig = plt.figure(figsize=(fig_width, fig_height))
     ax = fig.add_subplot(1, 1, 1)
     ax.spines['top'].set_visible(False)
     ax.spines['right'].set_visible(False)
@@ -107,7 +149,7 @@ def plot_rectangular_tree(tree, output_file):
     ax.get_yaxis().set_visible(False)
 
     def get_branch_label(clade):
-        if clade.branch_length and clade.branch_length > 0.001:
+        if show_branch_labels and clade.branch_length and clade.branch_length > 0.001:
             return f"{clade.branch_length:.3f}"
         return None
 
@@ -119,12 +161,16 @@ def plot_rectangular_tree(tree, output_file):
         label_func=lambda x: x.name if x.is_terminal() else "",
         branch_labels=get_branch_label,
     )
+
+    ax.tick_params(axis='y', labelsize=label_size)
+    for label in ax.get_yticklabels():
+        label.set_fontsize(label_size)
     
     terminals = tree.get_terminals()
     for i, clade in enumerate(terminals):
         y_pos = i + 1
         x_pos = tree.distance(tree.root, clade)
-        ax.scatter(x_pos, y_pos, color='steelblue', s=80, zorder=10, edgecolors='white', linewidth=0.5)
+        ax.scatter(x_pos, y_pos, color='steelblue', s=marker_size, zorder=10, edgecolors='white', linewidth=0.5)
     
     plt.title("Phylogenetic Tree (Rectangular)", fontsize=14)
     plt.xlabel("Genetic Distance", fontsize=12)
@@ -161,8 +207,25 @@ def get_coords(tree):
 
 def plot_circular_tree(tree, output_file):
     coords = get_coords(tree)
-    
-    fig = plt.figure(figsize=(15, 15))
+    n_terminals = len(tree.get_terminals())
+
+    if n_terminals <= 50:
+        fig_size = 15
+        marker_size = 40
+        label_size = 8
+        show_labels = True
+    elif n_terminals <= 150:
+        fig_size = max(18, n_terminals * 0.15)
+        marker_size = 25
+        label_size = 6
+        show_labels = True
+    else:
+        fig_size = max(22, n_terminals * 0.1)
+        marker_size = 15
+        label_size = 5
+        show_labels = n_terminals <= 300
+
+    fig = plt.figure(figsize=(fig_size, fig_size))
     ax = fig.add_subplot(111, projection='polar')
     
     ax.set_frame_on(False)
@@ -192,18 +255,19 @@ def plot_circular_tree(tree, output_file):
 
     for clade, (r, theta) in coords.items():
         if clade.is_terminal():
-            ax.scatter(theta, r, color='steelblue', s=40, zorder=10, edgecolors='white', linewidth=0.5)
+            ax.scatter(theta, r, color='steelblue', s=marker_size, zorder=10, edgecolors='white', linewidth=0.5)
             
-            rot = math.degrees(theta)
-            if 90 < rot < 270:
-                rot += 180
-                ha = 'right'
-                label_r = r + (max_r * 0.02)
-            else:
-                ha = 'left'
-                label_r = r + (max_r * 0.01)
-                
-            ax.text(theta, label_r, clade.name, rotation=rot, ha=ha, va='center', fontsize=8)
+            if show_labels:
+                rot = math.degrees(theta)
+                if 90 < rot < 270:
+                    rot += 180
+                    ha = 'right'
+                    label_r = r + (max_r * 0.02)
+                else:
+                    ha = 'left'
+                    label_r = r + (max_r * 0.01)
+                    
+                ax.text(theta, label_r, clade.name, rotation=rot, ha=ha, va='center', fontsize=label_size)
     
     plt.title("Phylogenetic Tree (Circular)", fontsize=16, y=1.05)
     plt.tight_layout()
@@ -213,8 +277,25 @@ def plot_circular_tree(tree, output_file):
 
 def plot_unrooted_tree(tree, output_file):
     coords = get_coords(tree)
-    
-    fig, ax = plt.subplots(figsize=(15, 15))
+    n_terminals = len(tree.get_terminals())
+
+    if n_terminals <= 50:
+        fig_size = 15
+        marker_size = 40
+        label_size = 8
+        show_labels = True
+    elif n_terminals <= 150:
+        fig_size = max(18, n_terminals * 0.15)
+        marker_size = 25
+        label_size = 6
+        show_labels = True
+    else:
+        fig_size = max(22, n_terminals * 0.1)
+        marker_size = 15
+        label_size = 5
+        show_labels = n_terminals <= 300
+
+    fig, ax = plt.subplots(figsize=(fig_size, fig_size))
     ax.set_aspect('equal')
     ax.axis('off')
     
@@ -242,22 +323,23 @@ def plot_unrooted_tree(tree, output_file):
 
     for clade, (x, y) in cart_coords.items():
         if clade.is_terminal():
-            ax.scatter(x, y, color='steelblue', s=40, zorder=10, edgecolors='white', linewidth=0.5)
+            ax.scatter(x, y, color='steelblue', s=marker_size, zorder=10, edgecolors='white', linewidth=0.5)
             
-            r, theta = coords[clade]
-            rot = math.degrees(theta)
-            
-            if 90 < rot < 270:
-                rot += 180
-                ha = 'right'
-                lx = x + (max_r * 0.02) * math.cos(theta)
-                ly = y + (max_r * 0.02) * math.sin(theta)
-            else:
-                ha = 'left'
-                lx = x + (max_r * 0.01) * math.cos(theta)
-                ly = y + (max_r * 0.01) * math.sin(theta)
-            
-            ax.text(lx, ly, clade.name, rotation=rot, ha=ha, va='center', fontsize=8, rotation_mode='anchor')
+            if show_labels:
+                r, theta = coords[clade]
+                rot = math.degrees(theta)
+                
+                if 90 < rot < 270:
+                    rot += 180
+                    ha = 'right'
+                    lx = x + (max_r * 0.02) * math.cos(theta)
+                    ly = y + (max_r * 0.02) * math.sin(theta)
+                else:
+                    ha = 'left'
+                    lx = x + (max_r * 0.01) * math.cos(theta)
+                    ly = y + (max_r * 0.01) * math.sin(theta)
+                
+                ax.text(lx, ly, clade.name, rotation=rot, ha=ha, va='center', fontsize=label_size, rotation_mode='anchor')
     
     plt.title("Phylogenetic Tree (Radial)", fontsize=16)
     plt.tight_layout()
