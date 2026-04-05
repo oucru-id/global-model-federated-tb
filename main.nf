@@ -9,7 +9,7 @@ log.info """
 """
 
 include { FEDERATED_MERGE }  from './workflows/federated_merge.nf'
-include { VISUALIZATION }    from './workflows/visualization.nf'
+//include { VISUALIZATION }    from './workflows/visualization.nf'
 include { VERSIONS }         from './workflows/utils.nf'
 
 workflow {
@@ -26,11 +26,11 @@ workflow {
         params.primary_anchor
     )
     
-    VISUALIZATION(
-        FEDERATED_MERGE.out.matrix,
-        FEDERATED_MERGE.out.metadata,
-        FEDERATED_MERGE.out.tree
-    )
+    //VISUALIZATION(
+    //    FEDERATED_MERGE.out.matrix,
+    //    FEDERATED_MERGE.out.metadata,
+    //    FEDERATED_MERGE.out.tree
+    //)
     
     VERSIONS()
 }
