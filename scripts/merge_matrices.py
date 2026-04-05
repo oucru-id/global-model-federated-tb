@@ -6,6 +6,7 @@ import numpy as np
 import argparse
 import json
 import os
+import sys
 import warnings
 from scipy.spatial.distance import squareform
 from scipy.optimize import minimize
@@ -86,42 +87,43 @@ def calculate_sample_bias(samples, all_known_distances, present_anchors, origina
 
     sample_bias = {}
     print("\n  Calculating Per-Sample Bias (PSBC)")
+    sys.stdout.flush()
 
     sidx = {s: i for i, s in enumerate(samples)}
     orig_arr = original_matrix.values
-    anchor_idxs = [sidx[a] for a in present_anchors if a in sidx]
+    anchor_idxs = np.array([sidx[a] for a in present_anchors if a in sidx])
+    anchor_dists = orig_arr[:, anchor_idxs]  # (n_samp, n_anchors)
 
     for s in samples:
-        biases = []
-        known_neighbors = all_known_distances.get(s, {})
         si = sidx[s]
-
-        for k, known_dist in known_neighbors.items():
-            if known_dist < 500:
-                continue
-
-            ki = sidx[k]
-            min_anchor_sum = float('inf')
-            for ai in anchor_idxs:
-                d1 = orig_arr[si, ai]
-                d2 = orig_arr[ki, ai]
-                if not np.isnan(d1) and not np.isnan(d2) and d1 > 0 and d2 > 0:
-                    dist_sum = d1 + d2
-                    if dist_sum < min_anchor_sum:
-                        min_anchor_sum = dist_sum
-
-            if min_anchor_sum < float('inf'):
-                bias = min_anchor_sum - known_dist
-                biases.append(bias)
+        known_neighbors = all_known_distances.get(s, {})
+        if not known_neighbors:
+            continue
+        # Get all far neighbors at once
+        neighbor_items = [(sidx[k], d) for k, d in known_neighbors.items() if d >= 500]
+        if not neighbor_items:
+            continue
+        ki_arr = np.array([ki for ki, _ in neighbor_items])
+        known_dists = np.array([d for _, d in neighbor_items])
+        # Vectorized: min over anchors of (d[s,a] + d[k,a])
+        d_s_anc = anchor_dists[si]  # (n_anchors,)
+        d_k_anc = anchor_dists[ki_arr]  # (n_neighbors, n_anchors)
+        anc_sums = d_s_anc[None, :] + d_k_anc
+        valid_anc = (~np.isnan(d_s_anc[None, :]) & ~np.isnan(d_k_anc) &
+                     (d_s_anc[None, :] > 0) & (d_k_anc > 0))
+        anc_sums_masked = np.where(valid_anc, anc_sums, np.inf)
+        min_anc_sum = np.min(anc_sums_masked, axis=1)
+        valid_bias = min_anc_sum < np.inf
+        biases = min_anc_sum[valid_bias] - known_dists[valid_bias]
 
         if len(biases) >= 3:
-            median_bias = np.median(biases)
+            median_bias = float(np.median(biases))
             if median_bias > 100:
                 sample_bias[s] = median_bias
                 if s in ["ERR3588243", "ERR8170876_ont", "ERR4830684", "ERR8170873_ont", "ERR3806818"]:
                     print(f"    Bias detected for {s}: {median_bias:.1f} (from {len(biases)} far neighbors)")
         elif len(biases) > 0:
-             mean_bias = np.mean(biases)
+             mean_bias = float(np.mean(biases))
              if mean_bias > 100:
                  sample_bias[s] = mean_bias
                  if s in ["ERR3588243", "ERR8170876_ont", "ERR4830684"]:
@@ -438,20 +440,17 @@ def mds_cross_lab_estimation(incomplete_matrix, known_mask, sample_to_lab, matri
     coord_sidx = {s: i for i, s in enumerate(coord_samples)}
 
     km = known_mask.values
-    calib_mds = []
-    calib_actual = []
-    for i_c, s1 in enumerate(coord_samples):
-        i1 = sidx[s1]
-        for j_c in range(i_c + 1, len(coord_samples)):
-            s2 = coord_samples[j_c]
-            i2 = sidx[s2]
-            if km[i1, i2] and not np.isnan(mat[i1, i2]) and mat[i1, i2] > 0:
-                mds_d = np.sqrt(np.sum((coord_mat[i_c] - coord_mat[j_c]) ** 2))
-                calib_mds.append(mds_d)
-                calib_actual.append(mat[i1, i2])
-
-    calib_mds = np.array(calib_mds)
-    calib_actual = np.array(calib_actual)
+    # Vectorized MDS calibration using cdist
+    from scipy.spatial.distance import cdist as _cdist
+    _mds_dists_full = _cdist(coord_mat, coord_mat, 'euclidean')
+    _coord_gidx = np.array([sidx[s] for s in coord_samples])
+    _n_coord = len(coord_samples)
+    _km_coord = km[np.ix_(_coord_gidx, _coord_gidx)]
+    _mat_coord = mat[np.ix_(_coord_gidx, _coord_gidx)]
+    _upper_tri_coord = np.triu(np.ones((_n_coord, _n_coord), dtype=bool), k=1)
+    _valid_calib = _upper_tri_coord & _km_coord & ~np.isnan(_mat_coord) & (_mat_coord > 0)
+    calib_mds = _mds_dists_full[_valid_calib]
+    calib_actual = _mat_coord[_valid_calib]
     print(f"  MDS calibration pairs: {len(calib_mds)}")
 
     bin_models = {}
@@ -471,18 +470,17 @@ def mds_cross_lab_estimation(incomplete_matrix, known_mask, sample_to_lab, matri
     global_r2 = 1 - np.sum((calib_actual - (global_slope * calib_mds + global_intercept)) ** 2) / np.sum((calib_actual - np.mean(calib_actual)) ** 2)
     print(f"    global: slope={global_slope:.3f}, intercept={global_intercept:.1f}, R²={global_r2:.3f}")
 
+    # Vectorized MDS estimates
+    _mds_est_all = np.maximum(global_slope * _mds_dists_full + global_intercept, 0)
+    _not_known_coord = _upper_tri_coord & ~_km_coord
+    _nk_ci, _nk_cj = np.where(_not_known_coord)
     mds_estimates = {}
-    for i_c, s1 in enumerate(coord_samples):
-        i1 = sidx[s1]
-        for j_c in range(i_c + 1, len(coord_samples)):
-            s2 = coord_samples[j_c]
-            i2 = sidx[s2]
-            if not km[i1, i2]:  
-                mds_d = np.sqrt(np.sum((coord_mat[i_c] - coord_mat[j_c]) ** 2))
-                est = global_slope * mds_d + global_intercept
-                est = max(est, 0)
-                mds_estimates[(s1, s2)] = est
-                mds_estimates[(s2, s1)] = est
+    for _idx in range(len(_nk_ci)):
+        s1 = coord_samples[_nk_ci[_idx]]
+        s2 = coord_samples[_nk_cj[_idx]]
+        est = float(_mds_est_all[_nk_ci[_idx], _nk_cj[_idx]])
+        mds_estimates[(s1, s2)] = est
+        mds_estimates[(s2, s1)] = est
 
     print(f"  MDS estimates computed: {len(mds_estimates) // 2} cross-lab pairs")
     return mds_estimates
@@ -577,35 +575,40 @@ def impute_anchor_guided(incomplete_matrix, known_mask, anchors, sample_to_lab, 
             print(f"  Default weight factor ({category}): {weight_factors[category]:.3f}")
     
     within_lab_weights = {"very_close": [], "close": [], "mid_close": [], "medium_check": []}
-    for i_cal in range(n_samp):
-        d1_anc = orig_arr[i_cal, anchor_idxs]
-        if np.any(np.isnan(d1_anc)):
-            continue
-        for j_cal in range(i_cal + 1, n_samp):
-            if not orig_kmask_arr[i_cal, j_cal]:
-                continue
-            actual_dist = orig_arr[i_cal, j_cal]
-            if np.isnan(actual_dist) or actual_dist <= 0:
-                continue
-            d2_anc = orig_arr[j_cal, anchor_idxs]
-            valid_anc = ~np.isnan(d2_anc) & (d1_anc > 0) & (d2_anc > 0)
-            if valid_anc.sum() < 2:
-                continue
-            lower = float(np.max(np.abs(d1_anc[valid_anc] - d2_anc[valid_anc])))
-            upper = float(np.min(d1_anc[valid_anc] + d2_anc[valid_anc]))
-            rng = upper - lower
-            if rng <= 0:
-                continue
-            w = (actual_dist - lower) / rng
-            if 0 <= w <= 1:
-                if actual_dist < 100:
-                    within_lab_weights["very_close"].append(w)
-                elif actual_dist < 300:
-                    within_lab_weights["close"].append(w)
-                elif actual_dist < 500:
-                    within_lab_weights["mid_close"].append(w)
-                elif actual_dist < 1500:
-                    within_lab_weights["medium_check"].append(w)
+    print("  Computing within-lab weights (vectorized)...")
+    sys.stdout.flush()
+    _up_tri_wl = np.triu(np.ones((n_samp, n_samp), dtype=bool), k=1)
+    _known_wl = _up_tri_wl & orig_kmask_arr
+    _wl_i, _wl_j = np.where(_known_wl)
+    _actual_wl = orig_arr[_wl_i, _wl_j]
+    _valid_actual = ~np.isnan(_actual_wl) & (_actual_wl > 0)
+    _wl_i, _wl_j, _actual_wl = _wl_i[_valid_actual], _wl_j[_valid_actual], _actual_wl[_valid_actual]
+    _d1_anc = orig_arr[_wl_i][:, anchor_idxs]
+    _d2_anc = orig_arr[_wl_j][:, anchor_idxs]
+    _d1_ok = ~np.any(np.isnan(_d1_anc), axis=1)
+    _wl_i, _wl_j, _actual_wl = _wl_i[_d1_ok], _wl_j[_d1_ok], _actual_wl[_d1_ok]
+    _d1_anc, _d2_anc = _d1_anc[_d1_ok], _d2_anc[_d1_ok]
+    _va = ~np.isnan(_d2_anc) & (_d1_anc > 0) & (_d2_anc > 0)
+    _n_va = _va.sum(axis=1)
+    _has_enough = _n_va >= 2
+    _wl_i, _wl_j, _actual_wl = _wl_i[_has_enough], _wl_j[_has_enough], _actual_wl[_has_enough]
+    _d1_anc, _d2_anc, _va = _d1_anc[_has_enough], _d2_anc[_has_enough], _va[_has_enough]
+    _abs_diffs = np.abs(_d1_anc - _d2_anc)
+    _abs_diffs[~_va] = -np.inf
+    _lower_wl = np.max(_abs_diffs, axis=1)
+    _sums = _d1_anc + _d2_anc
+    _sums[~_va] = np.inf
+    _upper_wl = np.min(_sums, axis=1)
+    _rng_wl = _upper_wl - _lower_wl
+    _valid_rng = _rng_wl > 0
+    _w_all = np.where(_valid_rng, (_actual_wl - _lower_wl) / _rng_wl, -1)
+    _valid_w = _valid_rng & (_w_all >= 0) & (_w_all <= 1)
+    _w_vals = _w_all[_valid_w]
+    _a_vals = _actual_wl[_valid_w]
+    within_lab_weights["very_close"] = list(_w_vals[_a_vals < 100])
+    within_lab_weights["close"] = list(_w_vals[(_a_vals >= 100) & (_a_vals < 300)])
+    within_lab_weights["mid_close"] = list(_w_vals[(_a_vals >= 300) & (_a_vals < 500)])
+    within_lab_weights["medium_check"] = list(_w_vals[(_a_vals >= 500) & (_a_vals < 1500)])
     
     sub_weights = {}
     for cat, ws in within_lab_weights.items():
@@ -777,6 +780,7 @@ def impute_anchor_guided(incomplete_matrix, known_mask, anchors, sample_to_lab, 
     missing_pairs = [(samples[miss_i[k]], samples[miss_j[k]]) for k in range(len(miss_i))]
     
     print(f"\n  Missing pairs to impute: {len(missing_pairs)}")
+    sys.stdout.flush()
     
     n_anchors = len(present_anchors)
     anchor_anchor_dist = np.full((n_anchors, n_anchors), np.nan)
@@ -837,18 +841,83 @@ def impute_anchor_guided(incomplete_matrix, known_mask, anchors, sample_to_lab, 
         return fp_val, len(all_valid)
     
     fp_precomputed = {}
-    for s1, s2 in missing_pairs:
-        i1_fp = sidx[s1]
-        i2_fp = sidx[s2]
-        fp_val, n_valid = compute_four_point_estimate(i1_fp, i2_fp)
-        if fp_val is not None:
-            fp_precomputed[(s1, s2)] = fp_val
-            fp_precomputed[(s2, s1)] = fp_val
+    # Vectorized four-point batch precomputation
+    print("  Computing four-point estimates (vectorized)...")
+    sys.stdout.flush()
+    _ap_list = [(ai, aj) for ai in range(n_anchors) for aj in range(ai+1, n_anchors)]
+    _n_ap = len(_ap_list)
+    _ap_i = np.array([p[0] for p in _ap_list])
+    _ap_j = np.array([p[1] for p in _ap_list])
+    _ap_cd = anchor_anchor_dist[_ap_i, _ap_j]
+    _CHUNK = 200000
+    for _cs in range(0, len(miss_i), _CHUNK):
+        _ce = min(_cs + _CHUNK, len(miss_i))
+        _ci = miss_i[_cs:_ce]
+        _cj = miss_j[_cs:_ce]
+        _d_ac = fp_anchor_dists[_ci][:, _ap_i]
+        _d_bc = fp_anchor_dists[_cj][:, _ap_i]
+        _d_ad = fp_anchor_dists[_ci][:, _ap_j]
+        _d_bd = fp_anchor_dists[_cj][:, _ap_j]
+        _s2v = _d_ac + _d_bd
+        _s3v = _d_ad + _d_bc
+        _fp_est = np.maximum(_s2v, _s3v) - _ap_cd[None, :]
+        _vld = ((_d_ac > 0) & ~np.isnan(_d_ac) & (_d_bc > 0) & ~np.isnan(_d_bc) &
+                (_d_ad > 0) & ~np.isnan(_d_ad) & (_d_bd > 0) & ~np.isnan(_d_bd) &
+                ~np.isnan(_ap_cd[None, :]) & (_fp_est > 0))
+        _n_vld = _vld.sum(axis=1)
+        _is_res = _vld & (np.abs(_s2v - _s3v) > 0.05 * np.abs(_ap_cd[None, :])) & (np.abs(_s2v - _s3v) > 20)
+        _n_res = _is_res.sum(axis=1)
+        _fp_masked = np.where(_vld, _fp_est, np.nan)
+        _fp_res_masked = np.where(_is_res, _fp_est, np.nan)
+        _has = _n_vld >= 3
+        with np.errstate(all='ignore'):
+            _med_res = np.nanmedian(_fp_res_masked, axis=1)
+            _p25_all = np.nanpercentile(_fp_masked, 25, axis=1)
+        _result = np.where(_n_res >= 5, _med_res,
+                  np.where(_n_res >= 2, 0.7 * _med_res + 0.3 * _p25_all, _p25_all))
+        _ok = _has & ~np.isnan(_result)
+        for _ki in np.where(_ok)[0]:
+            _pi = _cs + _ki
+            s1 = samples[miss_i[_pi]]
+            s2 = samples[miss_j[_pi]]
+            fp_precomputed[(s1, s2)] = float(_result[_ki])
+            fp_precomputed[(s2, s1)] = float(_result[_ki])
+        if _cs > 0 and _cs % 1000000 == 0:
+            print(f"    ... processed {_cs}/{len(miss_i)} pairs")
+            sys.stdout.flush()
     
     print(f"  Four-point pre-computed for {len(fp_precomputed) // 2} pairs")
+    sys.stdout.flush()
     
     close_pairs_to_impute = []
     processed_pairs = set()
+    
+    # Pre-compute same-lab close neighbor lookups for calibration
+    print("  Pre-computing neighbor lookup structures...")
+    sys.stdout.flush()
+    _lab_bits = np.zeros(n_samp, dtype=np.int64)
+    for _s, _labs in sample_to_lab.items():
+        if _s in sidx:
+            for _l in _labs:
+                if _l < 63:
+                    _lab_bits[sidx[_s]] |= (1 << _l)
+    _same_lab_mat = (_lab_bits[:, None] & _lab_bits[None, :]) > 0
+    _kc_150 = orig_kmask_arr & ~np.isnan(orig_arr) & (orig_arr > 0) & (orig_arr < 150) & _same_lab_mat
+    _kc_400 = orig_kmask_arr & ~np.isnan(orig_arr) & (orig_arr > 0) & (orig_arr < 400) & _same_lab_mat
+    np.fill_diagonal(_kc_150, False)
+    np.fill_diagonal(_kc_400, False)
+    _close_nbrs_150 = {}
+    _close_nbrs_400 = {}
+    for _i in range(n_samp):
+        _n150 = np.where(_kc_150[_i])[0]
+        if len(_n150) > 0:
+            _close_nbrs_150[_i] = list(zip(_n150.tolist(), orig_arr[_i, _n150].tolist()))
+        _n400 = np.where(_kc_400[_i])[0]
+        if len(_n400) > 0:
+            _close_nbrs_400[_i] = list(zip(_n400.tolist(), orig_arr[_i, _n400].tolist()))
+    del _same_lab_mat, _kc_150, _kc_400
+    print(f"  Neighbor lookups: {sum(len(v) for v in _close_nbrs_150.values())} close-150 edges, {sum(len(v) for v in _close_nbrs_400.values())} close-400 edges")
+    sys.stdout.flush()
     
     MAX_PASSES = 3
     
@@ -1046,31 +1115,19 @@ def impute_anchor_guided(incomplete_matrix, known_mask, anchors, sample_to_lab, 
                 else:
                     close_calibration = []
                     if same_lineage_group:
-                        for other in samples:
-                            if other == s1 or other == s2:
-                                continue
-                            oi = sidx[other]
-                            other_labs = set(sample_to_lab.get(other, []))
-                            
-                            if s1_labs & other_labs and orig_kmask_arr[i1, oi]:
-                                d = orig_arr[i1, oi]
-                                if 0 < d < 150:
-                                    other_profile = sample_profiles.get(other, np.array([]))
-                                    if len(other_profile) == len(profile2):
-                                        other_diffs = np.abs(profile2 - other_profile)
-                                        valid = ~np.isnan(other_diffs)
-                                        if valid.sum() >= 3 and np.nanmax(other_diffs) < 25:
-                                            close_calibration.append(d)
-                            
-                            if s2_labs & other_labs and orig_kmask_arr[i2, oi]:
-                                d = orig_arr[i2, oi]
-                                if 0 < d < 150:
-                                    other_profile = sample_profiles.get(other, np.array([]))
-                                    if len(other_profile) == len(profile1):
-                                        other_diffs = np.abs(profile1 - other_profile)
-                                        valid = ~np.isnan(other_diffs)
-                                        if valid.sum() >= 3 and np.nanmax(other_diffs) < 25:
-                                            close_calibration.append(d)
+                        # Use pre-computed neighbor lookup instead of scanning all samples
+                        for ni, d in _close_nbrs_150.get(i1, []):
+                            if ni == i2: continue
+                            diffs = np.abs(profile2 - profile_arr[ni])
+                            valid = ~np.isnan(diffs)
+                            if valid.sum() >= 3 and np.nanmax(diffs[valid]) < 25:
+                                close_calibration.append(d)
+                        for ni, d in _close_nbrs_150.get(i2, []):
+                            if ni == i1: continue
+                            diffs = np.abs(profile1 - profile_arr[ni])
+                            valid = ~np.isnan(diffs)
+                            if valid.sum() >= 3 and np.nanmax(diffs[valid]) < 25:
+                                close_calibration.append(d)
                     
                     if close_calibration:
                         close_estimate = np.median(close_calibration) + max_diff * 2
@@ -1117,38 +1174,23 @@ def impute_anchor_guided(incomplete_matrix, known_mask, anchors, sample_to_lab, 
                                     print(f"    Found lineage cross-lab reference: {sa}↔{sb} = {known_dist}")
                     
                     if not either_deep:
-                        for other in samples:
-                            if other == s1 or other == s2:
-                                continue
-                            oi = sidx[other]
-                            other_labs = set(sample_to_lab.get(other, []))
-                            if s1_labs & other_labs and known_arr[i1, oi]:
-                                d_s1_other = orig_arr[i1, oi]
-                                if d_s1_other > 0 and d_s1_other < 400:
-                                    other_profile = sample_profiles.get(other, np.array([]))
-                                    if len(other_profile) == len(profile2):
-                                        other_s2_diffs = np.abs(profile2 - other_profile)
-                                        valid_other = ~np.isnan(other_s2_diffs)
-                                        if valid_other.sum() >= 3:
-                                            other_s2_max_diff = np.nanmax(other_s2_diffs)
-                                            if other_s2_max_diff < 50:
-                                                calibration_distances.append(d_s1_other)
-                                                if should_debug:
-                                                    print(f"    Calibration via {other}: d_s1={d_s1_other:.0f}, profile_diff={other_s2_max_diff:.0f}")
-                            
-                            if s2_labs & other_labs and known_arr[i2, oi]:
-                                d_s2_other = orig_arr[i2, oi]
-                                if d_s2_other > 0 and d_s2_other < 400:
-                                    other_profile = sample_profiles.get(other, np.array([]))
-                                    if len(other_profile) == len(profile1):
-                                        other_s1_diffs = np.abs(profile1 - other_profile)
-                                        valid_other = ~np.isnan(other_s1_diffs)
-                                        if valid_other.sum() >= 3:
-                                            other_s1_max_diff = np.nanmax(other_s1_diffs)
-                                            if other_s1_max_diff < 50:
-                                                calibration_distances.append(d_s2_other)
-                                                if should_debug:
-                                                    print(f"    Calibration via {other}: d_s2={d_s2_other:.0f}, profile_diff={other_s1_max_diff:.0f}")
+                        # Use pre-computed neighbor lookup instead of scanning all samples
+                        for ni, d_s1_other in _close_nbrs_400.get(i1, []):
+                            if ni == i2: continue
+                            diffs = np.abs(profile2 - profile_arr[ni])
+                            valid_other = ~np.isnan(diffs)
+                            if valid_other.sum() >= 3 and np.nanmax(diffs[valid_other]) < 50:
+                                calibration_distances.append(d_s1_other)
+                                if should_debug:
+                                    print(f"    Calibration via {samples[ni]}: d_s1={d_s1_other:.0f}, profile_diff={np.nanmax(diffs[valid_other]):.0f}")
+                        for ni, d_s2_other in _close_nbrs_400.get(i2, []):
+                            if ni == i1: continue
+                            diffs = np.abs(profile1 - profile_arr[ni])
+                            valid_other = ~np.isnan(diffs)
+                            if valid_other.sum() >= 3 and np.nanmax(diffs[valid_other]) < 50:
+                                calibration_distances.append(d_s2_other)
+                                if should_debug:
+                                    print(f"    Calibration via {samples[ni]}: d_s2={d_s2_other:.0f}, profile_diff={np.nanmax(diffs[valid_other]):.0f}")
                     else:
                         if should_debug:
                             print(f"    SKIPPING calibration")
@@ -1291,6 +1333,7 @@ def impute_anchor_guided(incomplete_matrix, known_mask, anchors, sample_to_lab, 
                         high_confidence_arr[i2, i1] = True
         
         print(f"  Pass {pass_num}: added {pairs_added_this_pass} estimates")
+        sys.stdout.flush()
         
         if pairs_added_this_pass == 0 and pass_num > 0:
             break
@@ -1405,6 +1448,7 @@ def impute_anchor_guided(incomplete_matrix, known_mask, anchors, sample_to_lab, 
                 print(f"    estimate={close_estimate:.0f}")
     
     print(f"  Cross-lab VERY_CLOSE detected: {len(crosslab_very_close)}")
+    sys.stdout.flush()
 
     neighbor_bridge_count = 0
     
@@ -1510,6 +1554,7 @@ def impute_anchor_guided(incomplete_matrix, known_mask, anchors, sample_to_lab, 
             imputation_stats["neighbor_bridge"] = imputation_stats.get("neighbor_bridge", 0) + 1
     
     print(f"  Neighbor-bridge estimated: {neighbor_bridge_count}")
+    sys.stdout.flush()
 
     fp_post_corrections = 0
     fp_post_unprotected = 0
@@ -1609,6 +1654,7 @@ def impute_anchor_guided(incomplete_matrix, known_mask, anchors, sample_to_lab, 
             remaining_pairs.append((s1, s2))
     
     print(f"  Remaining pairs to impute with anchor triangulation: {len(remaining_pairs)}")
+    sys.stdout.flush()
     
     for s1, s2 in remaining_pairs:
         should_debug = (s1, s2) in debug_pairs
@@ -2016,6 +2062,7 @@ def impute_anchor_guided(incomplete_matrix, known_mask, anchors, sample_to_lab, 
             mat_arr[i2_r, i1_r] = fallback_val
     
     print(f"  Imputation stats: {imputation_stats}")
+    sys.stdout.flush()
 
     restore_mask = known_mask.values
     mat_arr[restore_mask] = orig_known_arr[restore_mask]
@@ -2489,104 +2536,132 @@ def main():
     wm_pre_changes = 0
     wm_pre_total = 0.0
     wm_pre_capped = 0
-    
+
+    # Pre-compute validity matrix and anchor membership for batched WM
+    _di_valid_wm = (M_pre > 0) & ~np.isnan(M_pre)  # (n_pre, n_pre)
+    _is_anchor_wm = np.zeros(n_pre, dtype=bool)
+    _is_anchor_wm[anchor_idx_pre] = True
+
     for i in range(n_pre):
-        if not refinable_pre[i].any():
+        j_candidates = np.where(refinable_pre[i])[0]
+        if len(j_candidates) == 0:
             continue
-        
-        d_i = M_pre[i, :]
-        km_i = km_pre[i, :]
-        
-        j_indices = np.where(refinable_pre[i])[0]
-        
-        for j in j_indices:
-            current = M_pre[i, j]
-            
-            if current >= 500:
-                continue
-            
-            d_j = M_pre[j, :]
-            km_j = km_pre[j, :]
-            
-            valid = np.ones(n_pre, dtype=bool)
-            valid[i] = False
-            valid[j] = False
-            valid &= (d_i > 0) & (d_j > 0) & ~np.isnan(d_i) & ~np.isnan(d_j)
-            
-            semi_known = valid & (km_i | km_j)
-            
-            if semi_known.sum() < 30:
-                continue
-            
-            dik = d_i[semi_known]
-            dkj = d_j[semi_known]
-            gap_sk = 2.0 * np.minimum(dik, dkj)
-            midpoint_sk = np.maximum(dik, dkj)
-            
-            weights = 1.0 / np.maximum(gap_sk, 1.0)
-            
-            sorted_idx = np.argsort(midpoint_sk)
-            sorted_mid = midpoint_sk[sorted_idx]
-            sorted_w = weights[sorted_idx]
-            cum_w = np.cumsum(sorted_w)
-            half_w = cum_w[-1] / 2.0
-            wm_idx = np.searchsorted(cum_w, half_w)
-            wm_idx = min(wm_idx, len(sorted_mid) - 1)
-            weighted_median = sorted_mid[wm_idx]
-            
-            if cd_pre[i, j]:
-                self_anc_mask = np.array([a_idx != i and a_idx != j for a_idx in anchor_idx_pre])
-                if self_anc_mask.sum() < 3:
+        # Filter current < 500
+        _cur_i = M_pre[i, j_candidates]
+        j_indices = j_candidates[_cur_i < 500]
+        nj = len(j_indices)
+        if nj == 0:
+            continue
+
+        d_i = M_pre[i, :]                  # (n_pre,) shared for all j in this row
+        km_i = km_pre[i, :]                # (n_pre,)
+        vi_base = _di_valid_wm[i].copy()   # base validity for row i
+        vi_base[i] = False
+        prof_i_all = anchor_profile_pre[i]  # (n_anchors,) shared
+        # Anchor mask excluding i  (length n_anchors_pre)
+        anc_mask_i = np.ones(n_anchors_pre, dtype=bool)
+        for _aidx in range(n_anchors_pre):
+            if anchor_idx_pre[_aidx] == i:
+                anc_mask_i[_aidx] = False
+        # Pre-compute anchor upper bound components for i
+        _pv_upper_i = ~np.isnan(prof_i_all) & (prof_i_all > 0)
+
+        # Process j's in chunks to batch intermediary computation
+        _WM_CHUNK = 500
+        for c_start in range(0, nj, _WM_CHUNK):
+            j_chunk = j_indices[c_start:min(c_start + _WM_CHUNK, nj)]
+            nc = len(j_chunk)
+
+            d_j_batch = M_pre[j_chunk, :]       # (nc, n_pre)
+            km_j_batch = km_pre[j_chunk, :]      # (nc, n_pre)
+
+            # Batch validity: vi_base AND d_j valid AND k != j
+            vj = _di_valid_wm[j_chunk].copy()    # (nc, n_pre)
+            vj[np.arange(nc), j_chunk] = False
+            valid_batch = vi_base[np.newaxis, :] & vj  # (nc, n_pre)
+
+            # Batch semi-known and count
+            semi_known_batch = valid_batch & (km_i[np.newaxis, :] | km_j_batch)
+            n_semi = semi_known_batch.sum(axis=1)
+
+            # Batch midpoints and weights (shared for the chunk)
+            d_i_exp = d_i[np.newaxis, :]
+            midpoint_batch = np.maximum(d_i_exp, d_j_batch)
+            gap_batch = 2.0 * np.minimum(d_i_exp, d_j_batch)
+            weights_batch = 1.0 / np.maximum(gap_batch, 1.0)
+
+            for _li in range(nc):
+                if n_semi[_li] < 30:
                     continue
-                prof_i_cd = anchor_profile_pre[i][self_anc_mask]
-                prof_j_cd = anchor_profile_pre[j][self_anc_mask]
-                pv_cd = ~np.isnan(prof_i_cd) & ~np.isnan(prof_j_cd) & (prof_i_cd > 0) & (prof_j_cd > 0)
-                if pv_cd.sum() >= 3:
-                    max_pd_cd = float(np.max(np.abs(prof_i_cd[pv_cd] - prof_j_cd[pv_cd])))
-                    if max_pd_cd < 8:
-                        continue  
-                    elif max_pd_cd < 25 and weighted_median > current * 2:
-                        continue  
-            
-            if current < 80 and weighted_median > current * 3 and weighted_median > 200:
-                continue
-            
-            self_anc_mask_pb = np.array([a_idx != i and a_idx != j for a_idx in anchor_idx_pre])
-            prof_i_wm = anchor_profile_pre[i][self_anc_mask_pb] if self_anc_mask_pb.sum() >= 3 else anchor_profile_pre[i]
-            prof_j_wm = anchor_profile_pre[j][self_anc_mask_pb] if self_anc_mask_pb.sum() >= 3 else anchor_profile_pre[j]
-            pv_wm = ~np.isnan(prof_i_wm) & ~np.isnan(prof_j_wm) & (prof_i_wm > 0) & (prof_j_wm > 0)
-            if pv_wm.sum() >= 3:
-                max_pd_wm = float(np.max(np.abs(prof_i_wm[pv_wm] - prof_j_wm[pv_wm])))
-                if max_pd_wm < 80 and current < 400 and weighted_median > max(current * 2, 300):
+
+                j = j_chunk[_li]
+                current = M_pre[i, j]
+
+                sk = semi_known_batch[_li]
+                midpoint_sk = midpoint_batch[_li, sk]
+                weights_sk = weights_batch[_li, sk]
+
+                sorted_idx = np.argsort(midpoint_sk)
+                sorted_mid = midpoint_sk[sorted_idx]
+                sorted_w = weights_sk[sorted_idx]
+                cum_w = np.cumsum(sorted_w)
+                half_w = cum_w[-1] / 2.0
+                wm_idx = np.searchsorted(cum_w, half_w)
+                wm_idx = min(wm_idx, len(sorted_mid) - 1)
+                weighted_median = sorted_mid[wm_idx]
+
+                # Anchor mask excluding both i and j
+                anc_mask_ij = anc_mask_i if not _is_anchor_wm[j] else (anc_mask_i & (anchor_idx_pre != j))
+
+                if cd_pre[i, j]:
+                    if anc_mask_ij.sum() < 3:
+                        continue
+                    prof_i_cd = prof_i_all[anc_mask_ij]
+                    prof_j_cd = anchor_profile_pre[j][anc_mask_ij]
+                    pv_cd = ~np.isnan(prof_i_cd) & ~np.isnan(prof_j_cd) & (prof_i_cd > 0) & (prof_j_cd > 0)
+                    if pv_cd.sum() >= 3:
+                        max_pd_cd = float(np.max(np.abs(prof_i_cd[pv_cd] - prof_j_cd[pv_cd])))
+                        if max_pd_cd < 8:
+                            continue
+                        elif max_pd_cd < 25 and weighted_median > current * 2:
+                            continue
+
+                if current < 80 and weighted_median > current * 3 and weighted_median > 200:
                     continue
-            
-            anchor_upper_i = anchor_profile_pre[i]
-            anchor_upper_j = anchor_profile_pre[j]
-            pv_upper = ~np.isnan(anchor_upper_i) & ~np.isnan(anchor_upper_j) & (anchor_upper_i > 0) & (anchor_upper_j > 0)
-            if pv_upper.sum() >= 2:
-                hard_upper_wm = float(np.min(anchor_upper_i[pv_upper] + anchor_upper_j[pv_upper]))
-                weighted_median = min(weighted_median, hard_upper_wm * 0.85)
-            
-            new_val = max(weighted_median, 0)
-            
-            if current < 150 and new_val > current * 3:
-                self_anc_mask_cap = np.array([a_idx != i and a_idx != j for a_idx in anchor_idx_pre])
-                prof_i = anchor_profile_pre[i][self_anc_mask_cap]
-                prof_j = anchor_profile_pre[j][self_anc_mask_cap]
-                pv = ~np.isnan(prof_i) & ~np.isnan(prof_j) & (prof_i > 0) & (prof_j > 0)
-                if pv.sum() >= 2:
-                    max_pd = float(np.max(np.abs(prof_i[pv] - prof_j[pv])))
-                    if max_pd < 20:
-                        cap = max(current * 3, 400)
-                        new_val = min(new_val, cap)
-                        wm_pre_capped += 1
-            
-            change = abs(new_val - current)
-            if change > 1.0:
-                M_pre[i, j] = new_val
-                M_pre[j, i] = new_val
-                wm_pre_changes += 1
-                wm_pre_total += change
+
+                prof_i_wm = prof_i_all[anc_mask_ij] if anc_mask_ij.sum() >= 3 else prof_i_all
+                prof_j_wm = anchor_profile_pre[j][anc_mask_ij] if anc_mask_ij.sum() >= 3 else anchor_profile_pre[j]
+                pv_wm = ~np.isnan(prof_i_wm) & ~np.isnan(prof_j_wm) & (prof_i_wm > 0) & (prof_j_wm > 0)
+                if pv_wm.sum() >= 3:
+                    max_pd_wm = float(np.max(np.abs(prof_i_wm[pv_wm] - prof_j_wm[pv_wm])))
+                    if max_pd_wm < 80 and current < 400 and weighted_median > max(current * 2, 300):
+                        continue
+
+                anchor_upper_j = anchor_profile_pre[j]
+                pv_upper = _pv_upper_i & ~np.isnan(anchor_upper_j) & (anchor_upper_j > 0)
+                if pv_upper.sum() >= 2:
+                    hard_upper_wm = float(np.min(prof_i_all[pv_upper] + anchor_upper_j[pv_upper]))
+                    weighted_median = min(weighted_median, hard_upper_wm * 0.85)
+
+                new_val = max(weighted_median, 0)
+
+                if current < 150 and new_val > current * 3:
+                    prof_i_cap = prof_i_all[anc_mask_ij]
+                    prof_j_cap = anchor_profile_pre[j][anc_mask_ij]
+                    pv = ~np.isnan(prof_i_cap) & ~np.isnan(prof_j_cap) & (prof_i_cap > 0) & (prof_j_cap > 0)
+                    if pv.sum() >= 2:
+                        max_pd = float(np.max(np.abs(prof_i_cap[pv] - prof_j_cap[pv])))
+                        if max_pd < 20:
+                            cap = max(current * 3, 400)
+                            new_val = min(new_val, cap)
+                            wm_pre_capped += 1
+
+                change = abs(new_val - current)
+                if change > 1.0:
+                    M_pre[i, j] = new_val
+                    M_pre[j, i] = new_val
+                    wm_pre_changes += 1
+                    wm_pre_total += change
     
     with np.errstate(invalid='ignore'):
         prof_diffs_3d = np.abs(anchor_profile_pre[:, np.newaxis, :] - anchor_profile_pre[np.newaxis, :, :])
@@ -2594,26 +2669,19 @@ def main():
         max_prof_diff_2d = np.nanmax(prof_diffs_3d, axis=2)
     
     very_close_mult = 6.0
-    n_corrected = 0
-    
-    for i in range(n_pre):
-        for j in range(i + 1, n_pre):
-            if km_pre[i, j]:
-                continue
-            prewm = M_pre_before_wm[i, j]
-            postwm = M_pre[i, j]
-            if prewm <= 0 or np.isnan(prewm) or postwm <= 0:
-                continue
-            
-            max_pd = max_prof_diff_2d[i, j]
-            n_close = n_close_anchors[i, j]
-            inflation_ratio = postwm / max(prewm, 1)
-            
-            if n_close >= min(7, n_anchors_pre) and inflation_ratio > 4 and prewm < 150 and max_pd < 15:
-                profile_est = max(max_pd * very_close_mult, 30)
-                M_pre[i, j] = profile_est
-                M_pre[j, i] = profile_est
-                n_corrected += 1
+    # Vectorized post-WM profile correction
+    _upper_pwm = np.triu(np.ones((n_pre, n_pre), dtype=bool), k=1)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        _inflation = np.where(M_pre_before_wm > 0, M_pre / np.maximum(M_pre_before_wm, 1), 0)
+    _corr_mask = (_upper_pwm & ~km_pre &
+                  (M_pre_before_wm > 0) & ~np.isnan(M_pre_before_wm) & (M_pre > 0) &
+                  (n_close_anchors >= min(7, n_anchors_pre)) &
+                  (_inflation > 4) & (M_pre_before_wm < 150) & (max_prof_diff_2d < 15))
+    _prof_est_pwm = np.maximum(max_prof_diff_2d * very_close_mult, 30)
+    _ci_pwm, _cj_pwm = np.where(_corr_mask)
+    M_pre[_ci_pwm, _cj_pwm] = _prof_est_pwm[_ci_pwm, _cj_pwm]
+    M_pre[_cj_pwm, _ci_pwm] = _prof_est_pwm[_ci_pwm, _cj_pwm]
+    n_corrected = len(_ci_pwm)
     n_restored = 0
     
     M_pre[km_pre] = global_matrix.values[km_pre]
@@ -2627,39 +2695,36 @@ def main():
     
     n_rescued = 0
     pre_svd_rescued_mask = np.zeros((n_pre, n_pre), dtype=bool)
-    for i in range(n_pre):
-        for j in range(i + 1, n_pre):
-            if km_pre[i, j]:
-                continue
-            pred_ij = M_pre[i, j]
-            if pred_ij < 200:
-                continue
-            
-            prof_i_r = anchor_profile_pre[i]
-            prof_j_r = anchor_profile_pre[j]
-            pv_r = ~np.isnan(prof_i_r) & ~np.isnan(prof_j_r) & (prof_i_r > 0) & (prof_j_r > 0)
-            if pv_r.sum() < 3:
-                continue
-            diffs_r = np.abs(prof_i_r[pv_r] - prof_j_r[pv_r])
-            max_anchor_diff = float(np.max(diffs_r))
-            median_anchor_diff = float(np.median(diffs_r))
-            
-            if max_anchor_diff < 30 and pred_ij > max_anchor_diff * 5 and pred_ij > 200:
-                if cd_pre[i, j]:
-                    s1_r = samples_pre[i]
-                    s2_r = samples_pre[j]
-                    mds_r = mds_estimates.get((s1_r, s2_r), None) or mds_estimates.get((s2_r, s1_r), None)
-                    if mds_r is not None and mds_r > 350:
-                        continue
-                
-                profile_est = max(max_anchor_diff * 4, median_anchor_diff * 6, 30)
-                profile_est = max(profile_est, float(np.max(diffs_r))) 
-                if profile_est < pred_ij * 0.5:
-                    M_pre[i, j] = profile_est
-                    M_pre[j, i] = profile_est
-                    pre_svd_rescued_mask[i, j] = True
-                    pre_svd_rescued_mask[j, i] = True
-                    n_rescued += 1
+    # Vectorized close-pair rescue
+    _upper_cpr = np.triu(np.ones((n_pre, n_pre), dtype=bool), k=1)
+    _valid_prof_3d = (~np.isnan(prof_diffs_3d) &
+                      (anchor_profile_pre[:, np.newaxis, :] > 0) &
+                      (anchor_profile_pre[np.newaxis, :, :] > 0))
+    _n_valid_prof = _valid_prof_3d.sum(axis=2)
+    _masked_diffs = np.where(_valid_prof_3d, prof_diffs_3d, np.nan)
+    with np.errstate(all='ignore'):
+        _median_prof_2d = np.nanmedian(_masked_diffs, axis=2)
+    _cpr_cand = (_upper_cpr & ~km_pre & (M_pre >= 200) & (_n_valid_prof >= 3) &
+                 (max_prof_diff_2d < 30) & (M_pre > max_prof_diff_2d * 5))
+    _prof_est_r = np.maximum(np.maximum(max_prof_diff_2d * 4, _median_prof_2d * 6), 30)
+    _prof_est_r = np.maximum(_prof_est_r, max_prof_diff_2d)
+    _cpr_cand &= (_prof_est_r < M_pre * 0.5)
+    # MDS check for CD pairs
+    if mds_estimates:
+        _mds_ci, _mds_cj = np.where(_cpr_cand & cd_pre)
+        for _mi in range(len(_mds_ci)):
+            _ri, _rj = _mds_ci[_mi], _mds_cj[_mi]
+            s1_r = samples_pre[_ri]
+            s2_r = samples_pre[_rj]
+            mds_r = mds_estimates.get((s1_r, s2_r), None) or mds_estimates.get((s2_r, s1_r), None)
+            if mds_r is not None and mds_r > 350:
+                _cpr_cand[_ri, _rj] = False
+    _ri_r, _rj_r = np.where(_cpr_cand)
+    M_pre[_ri_r, _rj_r] = _prof_est_r[_ri_r, _rj_r]
+    M_pre[_rj_r, _ri_r] = _prof_est_r[_ri_r, _rj_r]
+    pre_svd_rescued_mask[_ri_r, _rj_r] = True
+    pre_svd_rescued_mask[_rj_r, _ri_r] = True
+    n_rescued = len(_ri_r)
     
     print(f"    Close-pair rescue: {n_rescued} pairs corrected")
     
@@ -2757,92 +2822,56 @@ def main():
     
     n_refine_iters = 15
     for ref_iter in range(n_refine_iters):
+        # Vectorized triangle inequality bounds computation
+        lower_bound = np.zeros((n_ref, n_ref))
+        upper_bound = np.full((n_ref, n_ref), np.inf)
+        positive = (M > 0) & ~np.isnan(M)
+        for k in range(n_ref):
+            valid_k = positive[:, k]
+            if not valid_k.any():
+                continue
+            d_k = np.where(valid_k, M[:, k], 0)
+            sum_k = d_k[:, None] + d_k[None, :]
+            diff_k = np.abs(d_k[:, None] - d_k[None, :])
+            both_valid = valid_k[:, None] & valid_k[None, :]
+            both_valid[k, :] = False
+            both_valid[:, k] = False
+            np.maximum(lower_bound, np.where(both_valid, diff_k, 0), out=lower_bound)
+            np.minimum(upper_bound, np.where(both_valid, sum_k, np.inf), out=upper_bound)
+        
+        has_bounds = upper_bound < np.inf
+        over_upper = refinable & has_bounds & (M > upper_bound)
+        under_lower = refinable & (lower_bound > 0) & (M < lower_bound)
+        
         changes = 0
         total_change = 0.0
         
-        for i in range(n_ref):
-            if not refinable[i].any():
-                continue
-            
-            d_i = M[i, :]
-            km_i = km_ref[i, :]
-            
-            j_indices = np.where(refinable[i])[0]
-            if len(j_indices) == 0:
-                continue
-            
-            for j in j_indices:
-                d_j = M[j, :]
-                km_j = km_ref[j, :]
-                
-                valid = np.ones(n_ref, dtype=bool)
-                valid[i] = False
-                valid[j] = False
-                valid &= (d_i > 0) & (d_j > 0) & ~np.isnan(d_i) & ~np.isnan(d_j)
-                
-                if valid.sum() < 10:
-                    continue
-                
-                dik = d_i[valid]
-                dkj = d_j[valid]
-                lower_all = np.abs(dik - dkj)
-                upper_all = dik + dkj
-                
-                both_known = valid & km_i & km_j
-                
-                if both_known.sum() >= 2:
-                    hard_lower = np.max(np.abs(d_i[both_known] - d_j[both_known]))
-                    hard_upper = np.min(d_i[both_known] + d_j[both_known])
-                else:
-                    hard_lower = 0
-                    hard_upper = float('inf')
-                
-                semi_known = valid & (km_i | km_j)
-                sk_mask = semi_known[valid]
-                
-                if sk_mask.sum() >= 30:
-                    soft_lower = np.percentile(lower_all[sk_mask], 95)
-                    soft_upper = np.percentile(upper_all[sk_mask], 5)
-                else:
-                    soft_lower = np.percentile(lower_all, 95)
-                    soft_upper = np.percentile(upper_all, 5)
-                
-                current = M[i, j]
-                
-                max_lower = max(hard_lower, soft_lower)
-                min_upper = min(hard_upper, soft_upper) if hard_upper < float('inf') else soft_upper
-                
-                if max_lower >= min_upper:
-                    new_val = max_lower
-                elif current < max_lower:
-                    new_val = max_lower
-                elif current > min_upper:
-                    new_val = min_upper
-                else:
-                    tight_range = min_upper - max_lower
-                    midpoint = (max_lower + min_upper) / 2.0
-                    relative_range = tight_range / max(midpoint, 1.0)
-                    
-                    if relative_range < 2.0:
-                        alpha = min(0.4, 0.15 / max(relative_range, 0.01))
-                        new_val = (1 - alpha) * current + alpha * midpoint
-                    else:
-                        continue
-                
-                new_val = max(new_val, 0)
-                
-                if cd_only_ref[i, j] and new_val > M[i, j]:
-                    new_val = min(new_val, cd_ceiling)
-                
-                change = abs(new_val - current)
-                if change > 0.1:
-                    M[i, j] = new_val
-                    M[j, i] = new_val
-                    changes += 1
-                    total_change += change
+        if over_upper.any():
+            old_vals = M[over_upper]
+            new_vals = old_vals * 0.3 + upper_bound[over_upper] * 0.7
+            total_change += float(np.sum(np.abs(new_vals - old_vals)))
+            M[over_upper] = new_vals
+            changes += int(over_upper.sum())
+        
+        if under_lower.any():
+            old_vals = M[under_lower]
+            new_vals = old_vals * 0.3 + lower_bound[under_lower] * 0.7
+            total_change += float(np.sum(np.abs(new_vals - old_vals)))
+            M[under_lower] = new_vals
+            changes += int(under_lower.sum())
+        
+        # Close-detected ceiling
+        cd_over = refinable & cd_only_ref & (M > cd_ceiling)
+        if cd_over.any():
+            M[cd_over] = cd_ceiling
+        
+        # Symmetrize
+        i_idx, j_idx = np.triu_indices(n_ref, k=1)
+        M[j_idx, i_idx] = M[i_idx, j_idx]
         
         avg_change = total_change / max(changes, 1)
         print(f"  Refinement iter {ref_iter+1}: {changes} pairs adjusted, avg_change={avg_change:.1f}")
+        sys.stdout.flush()
         
         if changes == 0:
             break
@@ -3105,69 +3134,56 @@ def main():
     n_pv_iters = 10
     
     for pv_iter in range(n_pv_iters):
+        # Vectorized triangle inequality bounds
+        lower_bound_pv = np.zeros((n_v, n_v))
+        upper_bound_pv = np.full((n_v, n_v), np.inf)
+        positive_pv = (M_pv > 0) & ~np.isnan(M_pv)
+        for k in range(n_v):
+            valid_k = positive_pv[:, k]
+            if not valid_k.any():
+                continue
+            d_k = np.where(valid_k, M_pv[:, k], 0)
+            sum_k = d_k[:, None] + d_k[None, :]
+            diff_k = np.abs(d_k[:, None] - d_k[None, :])
+            both_valid = valid_k[:, None] & valid_k[None, :]
+            both_valid[k, :] = False
+            both_valid[:, k] = False
+            np.maximum(lower_bound_pv, np.where(both_valid, diff_k, 0), out=lower_bound_pv)
+            np.minimum(upper_bound_pv, np.where(both_valid, sum_k, np.inf), out=upper_bound_pv)
+        
+        has_bounds_pv = upper_bound_pv < np.inf
+        over_upper_pv = refinable_pv & has_bounds_pv & (M_pv > upper_bound_pv)
+        under_lower_pv = refinable_pv & (lower_bound_pv > 0) & (M_pv < lower_bound_pv)
+        
         changes_pv = 0
         total_change_pv = 0.0
-        for i_pv in range(n_v):
-            if not refinable_pv[i_pv].any():
-                continue
-            d_ipv = M_pv[i_pv, :]
-            j_indices_pv = np.where(refinable_pv[i_pv])[0]
-            for j_pv in j_indices_pv:
-                d_jpv = M_pv[j_pv, :]
-                valid_pv = np.ones(n_v, dtype=bool)
-                valid_pv[i_pv] = False
-                valid_pv[j_pv] = False
-                valid_pv &= (d_ipv > 0) & (d_jpv > 0) & ~np.isnan(d_ipv) & ~np.isnan(d_jpv)
-                if valid_pv.sum() < 10:
-                    continue
-                dik_pv = d_ipv[valid_pv]
-                dkj_pv = d_jpv[valid_pv]
-                lower_pv = np.abs(dik_pv - dkj_pv)
-                upper_pv = dik_pv + dkj_pv
-                bk_pv = valid_pv & km_pv[i_pv, :] & km_pv[j_pv, :]
-                if bk_pv.sum() >= 2:
-                    hard_lo = np.max(np.abs(d_ipv[bk_pv] - d_jpv[bk_pv]))
-                    hard_hi = np.min(d_ipv[bk_pv] + d_jpv[bk_pv])
-                else:
-                    hard_lo = 0
-                    hard_hi = float('inf')
-                sk_pv = valid_pv & (km_pv[i_pv, :] | km_pv[j_pv, :])
-                sk_m = sk_pv[valid_pv]
-                if sk_m.sum() >= 30:
-                    soft_lo = np.percentile(lower_pv[sk_m], 95)
-                    soft_hi = np.percentile(upper_pv[sk_m], 5)
-                else:
-                    soft_lo = np.percentile(lower_pv, 95)
-                    soft_hi = np.percentile(upper_pv, 5)
-                cur_pv = M_pv[i_pv, j_pv]
-                mlo = max(hard_lo, soft_lo)
-                mhi = min(hard_hi, soft_hi) if hard_hi < float('inf') else soft_hi
-                if mlo >= mhi:
-                    new_pv = mlo
-                elif cur_pv < mlo:
-                    new_pv = mlo
-                elif cur_pv > mhi:
-                    new_pv = mhi
-                else:
-                    tr = mhi - mlo
-                    mp = (mlo + mhi) / 2.0
-                    rr = tr / max(mp, 1.0)
-                    if rr < 2.0:
-                        al = min(0.4, 0.15 / max(rr, 0.01))
-                        new_pv = (1 - al) * cur_pv + al * mp
-                    else:
-                        continue
-                new_pv = max(new_pv, 0)
-                if cd_only_pv[i_pv, j_pv] and new_pv > M_pv[i_pv, j_pv]:
-                    new_pv = min(new_pv, cd_ceiling)
-                ch = abs(new_pv - cur_pv)
-                if ch > 0.1:
-                    M_pv[i_pv, j_pv] = new_pv
-                    M_pv[j_pv, i_pv] = new_pv
-                    changes_pv += 1
-                    total_change_pv += ch
+        
+        if over_upper_pv.any():
+            old_vals = M_pv[over_upper_pv]
+            new_vals = old_vals * 0.3 + upper_bound_pv[over_upper_pv] * 0.7
+            total_change_pv += float(np.sum(np.abs(new_vals - old_vals)))
+            M_pv[over_upper_pv] = new_vals
+            changes_pv += int(over_upper_pv.sum())
+        
+        if under_lower_pv.any():
+            old_vals = M_pv[under_lower_pv]
+            new_vals = old_vals * 0.3 + lower_bound_pv[under_lower_pv] * 0.7
+            total_change_pv += float(np.sum(np.abs(new_vals - old_vals)))
+            M_pv[under_lower_pv] = new_vals
+            changes_pv += int(under_lower_pv.sum())
+        
+        # Close-detected ceiling
+        cd_over_pv = refinable_pv & cd_only_pv & (M_pv > cd_ceiling)
+        if cd_over_pv.any():
+            M_pv[cd_over_pv] = cd_ceiling
+        
+        # Symmetrize
+        _i_idx_pv, _j_idx_pv = np.triu_indices(n_v, k=1)
+        M_pv[_j_idx_pv, _i_idx_pv] = M_pv[_i_idx_pv, _j_idx_pv]
+        
         avg_ch_pv = total_change_pv / max(changes_pv, 1)
         print(f"  Iter {pv_iter+1}: {changes_pv} pairs adjusted, avg_change={avg_ch_pv:.1f}")
+        sys.stdout.flush()
         if changes_pv == 0:
             break
     M_pv[km_pv] = global_matrix.values[km_pv]
@@ -3356,44 +3372,50 @@ def main():
 
     n_nc_corrected = 0
     n_nc_checked = 0
-    for i in range(n_nc):
-        lab_i_nc = sample_lab_nc.get(samples_nc[i], -1)
-        i_nbrs = lab_indices_nc.get(lab_i_nc, [])
-        for j in range(i + 1, n_nc):
-            if km_nc[i, j]:
-                continue
-            if rescued_mask[i, j] or pre_svd_rescued_mask[i, j]:
-                continue
-            lab_j_nc = sample_lab_nc.get(samples_nc[j], -1)
-            if lab_i_nc == lab_j_nc:
-                continue
-            pred_nc = M_nc[i, j]
-            if pred_nc >= 200:
-                continue
-            # Check anchor profile tightness
-            prof_i_nc = M_nc[i, anchor_idx_nc]
-            prof_j_nc = M_nc[j, anchor_idx_nc]
-            pv_nc = (prof_i_nc > 0) & (prof_j_nc > 0)
-            if pv_nc.sum() < 3:
-                continue
-            diffs_nc = np.abs(prof_i_nc[pv_nc] - prof_j_nc[pv_nc])
-            if np.max(diffs_nc) >= 30:
-                continue
-            n_nc_checked += 1
 
-            j_nbrs = lab_indices_nc.get(lab_j_nc, [])
-            close_j = [k for k in j_nbrs if k != j and km_nc[j, k] and M_nc[j, k] < 100]
-            close_i = [k for k in i_nbrs if k != i and km_nc[i, k] and M_nc[i, k] < 100]
-            nbr_d = [M_nc[i, k] for k in close_j] + [M_nc[j, k] for k in close_i]
+    # Vectorized candidate pre-filtering
+    _lab_arr_nc = np.full(n_nc, -1, dtype=int)
+    for s_nc_idx in range(n_nc):
+        _lab_arr_nc[s_nc_idx] = sample_lab_nc.get(samples_nc[s_nc_idx], -1)
+    _cross_lab_nc = _lab_arr_nc[:, np.newaxis] != _lab_arr_nc[np.newaxis, :]
+    _upper_nc = np.triu(np.ones((n_nc, n_nc), dtype=bool), k=1)
+    _cand_nc = (_upper_nc & ~km_nc & ~rescued_mask & ~pre_svd_rescued_mask
+                & _cross_lab_nc & (M_nc < 200) & (M_nc > 0))
 
-            if len(nbr_d) >= 3:
-                nbr_a = np.array(nbr_d)
-                med_nc = float(np.median(nbr_a))
-                frac_far_nc = float(np.mean(nbr_a > 200))
-                if med_nc > 200 and frac_far_nc > 0.5:
-                    M_nc[i, j] = med_nc
-                    M_nc[j, i] = med_nc
-                    n_nc_corrected += 1
+    # Anchor profile tightness check
+    _prof_nc = M_nc[:, anchor_idx_nc]  # (n_nc, n_anchors)
+    _max_pdiff_nc = np.zeros((n_nc, n_nc))
+    _n_valid_nc = np.zeros((n_nc, n_nc), dtype=int)
+    for _a in range(len(anchor_idx_nc)):
+        _v = _prof_nc[:, _a] > 0
+        _both_v = _v[:, np.newaxis] & _v[np.newaxis, :]
+        _d_a = np.abs(_prof_nc[:, _a:_a+1] - _prof_nc[:, _a:_a+1].T)
+        _max_pdiff_nc = np.maximum(_max_pdiff_nc, np.where(_both_v, _d_a, 0))
+        _n_valid_nc += _both_v.astype(int)
+    _cand_nc &= (_n_valid_nc >= 3) & (_max_pdiff_nc < 30)
+
+    _ci_nc, _cj_nc = np.where(_cand_nc)
+    n_nc_checked = len(_ci_nc)
+
+    for _idx_nc in range(len(_ci_nc)):
+        i, j = int(_ci_nc[_idx_nc]), int(_cj_nc[_idx_nc])
+        lab_i_nc = _lab_arr_nc[i]
+        lab_j_nc = _lab_arr_nc[j]
+
+        j_nbrs = lab_indices_nc.get(int(lab_j_nc), [])
+        i_nbrs = lab_indices_nc.get(int(lab_i_nc), [])
+        close_j = [k for k in j_nbrs if k != j and km_nc[j, k] and M_nc[j, k] < 100]
+        close_i = [k for k in i_nbrs if k != i and km_nc[i, k] and M_nc[i, k] < 100]
+        nbr_d = [M_nc[i, k] for k in close_j] + [M_nc[j, k] for k in close_i]
+
+        if len(nbr_d) >= 3:
+            nbr_a = np.array(nbr_d)
+            med_nc = float(np.median(nbr_a))
+            frac_far_nc = float(np.mean(nbr_a > 200))
+            if med_nc > 200 and frac_far_nc > 0.5:
+                M_nc[i, j] = med_nc
+                M_nc[j, i] = med_nc
+                n_nc_corrected += 1
 
     M_nc[km_nc] = global_matrix.values[km_nc]
     M_nc = (M_nc + M_nc.T) / 2.0
