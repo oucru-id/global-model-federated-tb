@@ -2,17 +2,17 @@
 
 nextflow.enable.dsl = 2
 
-log.info """
-    Mycobacterium tuberculosis Federated Phylogenetic (Central Node) 
-    Version: ${params.version}
-    Developed by SPHERES OUCRU-ID Team
-"""
-
 include { FEDERATED_MERGE }  from './workflows/federated_merge.nf'
 //include { VISUALIZATION }    from './workflows/visualization.nf'
 include { VERSIONS }         from './workflows/utils.nf'
 
 workflow {
+    log.info """
+        Mycobacterium tuberculosis Federated Phylogenetic (Central Node)
+        Version: ${params.version}
+        Developed by SPHERES OUCRU-ID Team
+    """
+
     matrix_ch = Channel.fromPath("${params.matrix_dir}/*.tsv", checkIfExists: true)
         .collect()
     
